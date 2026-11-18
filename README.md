@@ -101,4 +101,4 @@ the job number are deleted on the cluster.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Copyright 2026 The Tracktor authors.  Licensed under the [Apache License 2.0](LICENSE).
