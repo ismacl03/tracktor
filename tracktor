@@ -1,0 +1,2824 @@
+#!/usr/bin/python3
+"""
+Tracktor: one window for your running jobs and their history, both local (launched with `track`) and on Slurm
+clusters (over SSH).
+
+  - "Running": every job with its elapsed time; click one to see its output (it follows the end of the log unless
+    you scroll up to read).  Right-click: local -> "Terminate" (SIGTERM) / "Kill" (SIGKILL) the program started by
+    track (and its children); cluster -> "Cancel" (scancel).  For cluster jobs, the "Output (.out)" / "Errors (.err)"
+    buttons choose which file to show (if Slurm merges them, there is only output).
+  - Local jobs show RAM / CPU / GPU usage (summed over their child processes; GPU from nvidia-smi) and total RAM at
+    the top.  Two local jobs with the same command in the same folder are flagged as "⚠ duplicate".
+  - "History": finished jobs; click one to see its log.  Hover a job and a ✕ appears on the right to remove just
+    that one (its log is deleted too if it was a temporary one).  "Clear history" empties the list and deletes the
+    temporary local logs (those of `track` without -l, in <tracktor dir>/logs); logs saved with -l and files on the
+    clusters are never touched (finished cluster jobs are only hidden).  Search box and error filter.
+    Right-click a local job > "Run again…" (with track, in its folder).
+  - Clusters: estimated start time of queued jobs (squeue --start) and partition; job arrays are grouped in one
+    expandable row with their progress; click a finished job to see its efficiency (memory/CPU/time, like seff).
+  - Log: error lines in red, warnings in orange; Ctrl+F to search (Enter / Shift+Enter / Esc).
+  - System tray (on by default): closing the window keeps Tracktor in the tray showing the number of running jobs,
+    still watching and notifying; click the icon to show it, right-click > Quit to exit.  Single instance.
+  - "⚙" button: settings (refresh rates, history days, notifications, log font, ...).
+  - "+" button: add a Slurm cluster you can reach over SSH (a Host from ~/.ssh/config or user@server).  Each tab is
+    then grouped as "Local", "<cluster>", ...  Clusters are polled with squeue / sacct over SSH reusing one master
+    connection (ControlMaster).  If the cluster asks for a password, key passphrase or 2FA: right-click the cluster >
+    "Connect…" opens a terminal to log in once.
+Reads ~/.local/state/tracktor (or $TRACKTOR_DIR), the folders listed in ~/.config/tracktor/dirs and
+~/.config/tracktor/clusters.json.
+"""
+import html, json, os, re, shlex, shutil, signal, subprocess, sys, threading, time
+
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import (QFont, QColor, QTextCursor, QIcon, QPixmap, QPainter, QSyntaxHighlighter, QTextCharFormat,
+                         QKeySequence, QShortcut)
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
+try:
+    from PyQt6.QtDBus import QDBusConnection, QDBusMessage
+except ImportError:          # no D-Bus: no counter on the taskbar icon
+    QDBusConnection = None
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QSplitter, QTabWidget, QTreeWidget, QTreeWidgetItem,
+                             QPlainTextEdit, QVBoxLayout, QHBoxLayout, QWidget, QPushButton, QLabel, QMessageBox,
+                             QHeaderView, QAbstractItemView, QMenu, QDialog, QFormLayout, QLineEdit, QComboBox,
+                             QDialogButtonBox, QButtonGroup, QCheckBox, QSpinBox, QSystemTrayIcon, QListWidget,
+                             QStackedWidget, QTextEdit, QTabBar, QToolButton)
+
+APP = "Tracktor"
+CONF_DIR = os.path.expanduser("~/.config/tracktor")
+SETTINGS_FILE = os.path.join(CONF_DIR, "settings.json")
+CLUSTERS_FILE = os.path.join(CONF_DIR, "clusters.json")
+STATE_DIR = os.environ.get("TRACKTOR_DIR", os.path.expanduser("~/.local/state/tracktor"))
+CTRL_DIR = os.path.expanduser("~/.cache/tracktor/ssh")
+SSH = os.environ.get("TRACKTOR_SSH", "ssh")
+RED, GREY, ORANGE, GREEN = QColor("#d04040"), QColor("#888888"), QColor("#d08000"), QColor("#2e9e48")
+
+# Settings (⚙ button; saved in ~/.config/tracktor/settings.json).  key: (default, label, min, max, unit)
+DEFAULTS = {
+    "local_every": (2, "Local refresh interval", 1, 60, "s"),
+    "tail_kb": (400, "Amount of log shown (end of file)", 50, 20000, "KB"),
+    "log_font": (10, "Log font size", 6, 24, "pt"),
+    "show_pending": (True, "Show queued cluster jobs (PENDING)"),
+    "show_gpus": (True, "Show on which node and GPU(s) each cluster job runs (also in the queue of the status panel)"),
+    "wrap_log": (False, "Wrap long log lines"),
+    "notify_local": (True, "Notify when a local job finishes"),
+    "notify_cluster": (True, "Notify when a cluster job finishes"),
+    "notify_ok": (True, "Also notify jobs that finish fine (otherwise only errors)"),
+    "notify_start": (True, "Notify when a cluster job starts (goes from PD to R)"),
+    "tray": (True, "When the window is closed, keep running in the system tray (and keep notifying)"),
+    "tray_notice": (True, "Every time the window is closed, show a reminder that Tracktor keeps running"),
+    "close_on_exit": (False, "When quitting, also close the cluster connections (nothing is left in the background; "
+                             "you will have to log in again)"),
+}
+S = {k: v[0] for k, v in DEFAULTS.items()}
+
+# Settings of each cluster (saved in clusters.json).  key: (default, label, min, max, unit, tooltip)
+CLUSTER_SETTINGS = {
+    "every": (60, "Poll its jobs every", 10, 3600, "s",
+              "How often squeue/sacct are queried over SSH for your jobs.  Very often loads the login node."),
+    "cluster_log_every": (10, "Refresh the log of a running job every", 3, 600, "s",
+                          "How often the log you are looking at is re-read while the job runs."),
+    "hist_days": (7, "Days of history", 1, 90, "days", "How far back finished jobs are listed in History."),
+    "persist_hours": (9, "Keep the connection open after «Connect…» for", 1, 168, "h",
+                      "Only for clusters where you log in by hand (password / 2FA): how long the SSH connection "
+                      "stays open without activity."),
+    "info_every": (60, "Refresh its status panel every", 10, 3600, "s",
+                   "How often the cluster status panel (right-click the cluster > Show cluster status) is "
+                   "refreshed, only while it is open."),
+}
+
+
+def cset(c, k):
+    """A setting of one cluster (old versions had some of them global: that value is used as the default)."""
+    v = c.get(k) if c else None
+    return int(v) if v is not None else int(S.get(k, CLUSTER_SETTINGS[k][0]))
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE) as f:
+            S.update({k: v for k, v in json.load(f).items() if k in DEFAULTS and type(v) is type(DEFAULTS[k][0])})
+    except (OSError, ValueError):
+        pass
+    for k, d in DEFAULTS.items():     # numeric values within their range
+        if not isinstance(d[0], bool):
+            S[k] = min(max(S[k], d[2]), d[3])
+
+
+def save_settings():
+    os.makedirs(CONF_DIR, exist_ok=True)
+    with open(SETTINGS_FILE + ".tmp", "w") as f:
+        json.dump(S, f, indent=1)
+    os.replace(SETTINGS_FILE + ".tmp", SETTINGS_FILE)
+
+
+def tail_bytes():
+    return S["tail_kb"] * 1000
+
+
+ICON_DIRS = [os.path.join(os.path.dirname(os.path.realpath(__file__)), "icons"),     # in the repository
+             os.path.expanduser("~/.local/share/tracktor/icons")]                     # installed
+
+
+def icon_file(name):
+    return next((p for p in (os.path.join(d, name + ".svg") for d in ICON_DIRS) if os.path.exists(p)), None)
+
+
+_ICONS = {}
+
+
+def app_icon():
+    """The Tracktor icon: icons/tracktor.svg (next to this script or installed), or from the icon theme."""
+    if "app" not in _ICONS:
+        f = icon_file("tracktor")
+        _ICONS["app"] = QIcon(f) if f else QIcon.fromTheme("tracktor")
+    return _ICONS["app"]
+
+
+TRAY = None     # tray icon (if any): fallback for notifications when notify-send is missing
+
+
+def notify(title, body, error=False):
+    if shutil.which("notify-send"):
+        subprocess.Popen(["notify-send", "-a", APP, "-i", "dialog-error" if error else "tracktor", title,
+                          html.escape(body, quote=False)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    elif TRAY is not None:
+        TRAY.showMessage(title, body)
+
+
+# ───────────────────────────── local jobs ─────────────────────────────
+def job_dirs():
+    dirs = [STATE_DIR]
+    try:
+        dirs += [l.strip() for l in open(os.path.join(CONF_DIR, "dirs")) if l.strip()]
+    except OSError:
+        pass
+    return [d for d in dict.fromkeys(dirs) if os.path.isdir(d)]
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0); return True
+    except ProcessLookupError:
+        return False
+    except (PermissionError, ValueError):
+        return True
+
+
+def descendants(pid):
+    """PIDs of all descendants of pid (reading /proc), deepest first."""
+    children = {}
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open(f"/proc/{d}/stat") as f:
+                ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            continue
+        children.setdefault(ppid, []).append(int(d))
+    out, stack = [], [pid]
+    while stack:
+        for c in children.get(stack.pop(), []):
+            out.append(c); stack.append(c)
+    return out[::-1]
+
+
+def is_track(pid):
+    """Is pid really a `track` wrapper (a bash running track / track.sh)?  A job file could be stale or forged."""
+    try:
+        argv = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+    except OSError:
+        return False
+    return any(os.path.basename(a.decode(errors="replace")) in ("track", "track.sh") for a in argv[:3])
+
+
+def stop_job(pid, sig):
+    """Send sig to the program running under track (pid = track's bash) and its children.  Nothing is sent to the
+    bash itself: when the program dies, track writes the history entry with its exit code (143 = terminated,
+    137 = killed)."""
+    if not is_track(pid):
+        raise PermissionError(f"process {pid} is not a track job")
+    targets = descendants(pid) or [pid]
+    for p in targets:
+        try:
+            os.kill(p, sig)
+        except ProcessLookupError:
+            pass
+    return targets
+
+
+def read_tail(path, nbytes=None):
+    nbytes = nbytes or tail_bytes()
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2); size = f.tell(); f.seek(max(0, size - nbytes))
+            txt = f.read().decode("utf-8", "replace")
+    except OSError:
+        return "(cannot read the log: %s)" % path
+    return clean_log(txt)
+
+
+def clean_log(txt):
+    # progress bars rewrite the line with \r: keep the last version of each line
+    return "\n".join(l.split("\r")[-1] for l in txt.replace("\x00", "").split("\n"))
+
+
+def fmt_dt(sec):
+    sec = int(max(sec, 0)); d, sec = divmod(sec, 86400); h, r = divmod(sec, 3600); m, s = divmod(r, 60)
+    if d:
+        return f"{d}d{h:02d}h"
+    return f"{h}h{m:02d}m" if h else f"{m}m{s:02d}s"
+
+
+def running_jobs():
+    out = []
+    for d in job_dirs():
+        for fn in sorted(os.listdir(d)):
+            if not fn.endswith(".job"):
+                continue
+            try:
+                kv = dict(l.split("=", 1) for l in open(os.path.join(d, fn)).read().splitlines() if "=" in l)
+            except OSError:
+                continue
+            pid = int(kv.get("pid", "0") or 0)
+            if not alive(pid):
+                continue
+            log = kv.get("log", "")
+            if log and not os.path.isabs(log):
+                log = os.path.join(kv.get("cwd", os.path.dirname(d)), log)
+            out.append(dict(label=fn[:-4], pid=pid, start=int(kv.get("start", time.time())), log=log,
+                            cmd=kv.get("cmd", ""), cwd=kv.get("cwd", ""), argv=kv.get("argv", "")))
+    return out
+
+
+def history():
+    out = []
+    for d in job_dirs():
+        p = os.path.join(d, "history.jsonl")
+        if os.path.exists(p):
+            for l in open(p):
+                try:
+                    out.append(dict(json.loads(l), _dir=d, _line=l.strip()))
+                except json.JSONDecodeError:
+                    pass
+    return sorted(out, key=lambda r: r.get("end", 0), reverse=True)
+
+
+def temp_logs():
+    """Temporary logs (<tracktor dir>/logs/*.log) not used by a running job: the ones "Clear history" deletes."""
+    busy = {os.path.realpath(j["log"]) for j in running_jobs() if j["log"]}
+    out = []
+    for d in job_dirs():
+        ld = os.path.join(d, "logs")
+        if os.path.isdir(ld):
+            out += [p for p in (os.path.join(ld, fn) for fn in sorted(os.listdir(ld)) if fn.endswith(".log"))
+                    if os.path.isfile(p) and os.path.realpath(p) not in busy]
+    return out
+
+
+def remove_history_entry(r, delete_log=False):
+    """Remove one line from its folder's history.jsonl; with delete_log, also delete its log if it is temporary (logs
+    saved with -l are never deleted)."""
+    p = os.path.join(r["_dir"], "history.jsonl")
+    try:
+        lines = open(p).read().splitlines()
+    except OSError:
+        return
+    if r["_line"] in (l.strip() for l in lines):
+        i = next(k for k, l in enumerate(lines) if l.strip() == r["_line"])
+        del lines[i]
+        tmp = p + ".tmp"
+        with open(tmp, "w") as f:
+            f.write("".join(l + "\n" for l in lines))
+        os.replace(tmp, p)
+    log = r.get("log", "")
+    if delete_log and log and log in temp_logs():
+        try:
+            os.remove(log)
+        except OSError:
+            pass
+
+
+def gpu_info():
+    """-> (GPU status text, {pid: bytes of GPU memory it uses})."""
+    status, per_pid = "GPU: no nvidia-smi", {}
+    try:
+        o = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total",
+                            "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=3).stdout
+        u, m, t = [x.strip() for x in o.strip().splitlines()[0].split(",")]
+        status = f"GPU {u}%  {int(m) / 1024:.1f}/{int(t) / 1024:.1f} GB"
+        o = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=3).stdout
+        for l in o.strip().splitlines():
+            pid, mem = [x.strip() for x in l.split(",")]
+            per_pid[int(pid)] = per_pid.get(int(pid), 0) + int(mem) * 2 ** 20
+    except Exception:
+        pass
+    return status, per_pid
+
+
+PAGE, CLK = os.sysconf("SC_PAGE_SIZE"), os.sysconf("SC_CLK_TCK")
+
+
+def proc_table():
+    """One pass over /proc: {pid: (ppid, resident memory in bytes, CPU ticks used)}."""
+    out = {}
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open(f"/proc/{d}/stat") as f:
+                st = f.read().rsplit(")", 1)[1].split()
+            out[int(d)] = (int(st[1]), int(st[21]) * PAGE, int(st[11]) + int(st[12]))
+        except (OSError, IndexError, ValueError):
+            continue
+    return out
+
+
+def tree_of(pid, table, kids):
+    out, stack = [pid], [pid]
+    while stack:
+        for c in kids.get(stack.pop(), []):
+            out.append(c); stack.append(c)
+    return [p for p in out if p in table]
+
+
+def meminfo():
+    """-> (bytes of RAM in use, total bytes) or None."""
+    try:
+        kv = {l.split(":")[0]: int(l.split()[1]) * 1024 for l in open("/proc/meminfo")}
+        return kv["MemTotal"] - kv["MemAvailable"], kv["MemTotal"]
+    except (OSError, KeyError, ValueError, IndexError):
+        return None
+
+
+def fmt_bytes(b):
+    if b is None:
+        return ""
+    return f"{b / 2 ** 30:.1f} GB" if b >= 2 ** 30 else f"{b / 2 ** 20:.0f} MB"
+
+
+def local_exit_text(ex):
+    return "ok" if ex == 0 else {143: "terminated", 137: "killed", 130: "interrupted"}.get(ex, f"error {ex}")
+
+
+# ───────────────────────────── clusters (Slurm over SSH) ─────────────────────────────
+def load_clusters():
+    try:
+        with open(CLUSTERS_FILE) as f:
+            return [c for c in json.load(f) if c.get("name") and c.get("host")]
+    except (OSError, ValueError):
+        return []
+
+
+def save_clusters(clusters):
+    os.makedirs(CONF_DIR, exist_ok=True)
+    tmp = CLUSTERS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(clusters, f, indent=1, ensure_ascii=False)
+    os.replace(tmp, CLUSTERS_FILE)
+
+
+def ssh_config_hosts():
+    """Host aliases from ~/.ssh/config (without wildcards), offered when adding a cluster."""
+    out = []
+    try:
+        for l in open(os.path.expanduser("~/.ssh/config")):
+            t = l.strip().split()
+            if len(t) >= 2 and t[0].lower() == "host":
+                out += [h for h in t[1:] if not any(c in h for c in "*?!")]
+    except OSError:
+        pass
+    return list(dict.fromkeys(out))
+
+
+def ssh_opts(master="auto", persist="10m"):
+    os.makedirs(CTRL_DIR, mode=0o700, exist_ok=True)
+    return ["-o", f"ControlPath={CTRL_DIR}/%C", "-o", f"ControlMaster={master}", "-o", f"ControlPersist={persist}",
+            "-o", "ConnectTimeout=15", "-o", "LogLevel=ERROR"]
+
+
+MARK = "@@TRACKTOR@@"
+# Remote environment: a plain non-interactive shell (no -l: on some clusters the login profile rebuilds PATH and
+# loses /usr/bin/squeue).  If squeue is still missing, the profiles are sourced; the usual Slurm folders are also
+# appended to PATH.
+SLURM_PATH = "/usr/bin:/bin:/usr/local/bin:/opt/slurm/bin:/usr/local/slurm/bin"
+PRELUDE = (f'export PATH="$PATH:{SLURM_PATH}"; command -v squeue >/dev/null 2>&1 || '
+           f'{{ . /etc/profile; . ~/.bash_profile || . ~/.profile; export PATH="$PATH:{SLURM_PATH}"; }} '
+           f'</dev/null >/dev/null 2>&1; ')
+
+
+def bad_host(host):
+    """A host must not look like an ssh option (e.g. "-oProxyCommand=…")."""
+    return not host or host.startswith("-") or any(ch.isspace() for ch in host)
+
+
+def ssh_run(host, script, timeout=60, pre=""):
+    """Run a bash script on host without interaction (pre: the cluster's setup commands, e.g. module load slurm).
+    Returns (ok, output after the marker, error)."""
+    if bad_host(host):
+        return False, "", f"invalid SSH host: {host!r}"
+    pre = f"{{ {pre.strip().rstrip(';')}; }} </dev/null >/dev/null 2>&1; " if pre.strip() else ""
+    cmd = [SSH, *ssh_opts(), "-o", "BatchMode=yes", host,
+           "bash -c " + shlex.quote(f"{PRELUDE}{pre}echo {MARK}; {script}")]
+    try:
+        pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True)
+    except OSError as e:
+        return False, "", str(e)
+    ACTIVE.add(pr)
+    try:
+        out, err = pr.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        pr.kill(); pr.communicate()
+        return False, "", "no answer (timed out)"
+    finally:
+        ACTIVE.discard(pr)
+    if MARK not in out:
+        err = (err.strip().splitlines() or [f"ssh exited with code {pr.returncode}"])[-1]
+        return False, "", err
+    return True, out.split(MARK, 1)[1].lstrip("\n"), err.strip()
+
+
+ACTIVE = set()     # ssh queries in progress (to cut them when quitting)
+
+
+def kill_active():
+    for pr in list(ACTIVE):
+        try:
+            pr.kill()
+        except OSError:
+            pass
+
+
+def close_all_masters():
+    """Close every Tracktor master connection (those in ~/.cache/tracktor/ssh), for current clusters or not."""
+    try:
+        socks = [os.path.join(CTRL_DIR, f) for f in os.listdir(CTRL_DIR)]
+    except OSError:
+        return
+    for sock in socks:
+        try:
+            subprocess.run([SSH, "-o", f"ControlPath={sock}", "-O", "exit", "tracktor"], capture_output=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if os.path.exists(sock):        # leftover socket of a connection that no longer exists
+            try:
+                if subprocess.run([SSH, "-o", f"ControlPath={sock}", "-O", "check", "tracktor"],
+                                  capture_output=True, timeout=5).returncode != 0:
+                    os.remove(sock)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+
+def terminal_cmd(shell_cmd):
+    """Command that opens shell_cmd in an available terminal emulator (or None)."""
+    term = os.environ.get("TERMINAL")
+    cands = ([(term, ["-e"])] if term else []) + [("konsole", ["-e"]), ("gnome-terminal", ["--"]),
+             ("xfce4-terminal", ["-x"]), ("kitty", []), ("alacritty", ["-e"]), ("x-terminal-emulator", ["-e"]),
+             ("xterm", ["-e"])]
+    for exe, flag in cands:
+        if exe and shutil.which(exe):
+            return [exe, *flag, "bash", "-c", shell_cmd]
+    return None
+
+
+def connect_in_terminal(c):
+    """Open a terminal where the user logs in once; leaves a persistent master connection behind."""
+    if bad_host(c["host"]):
+        return False
+    h = cset(c, "persist_hours")
+    ssh = " ".join(shlex.quote(x) for x in [SSH, *ssh_opts("yes", f"{h}h"), c["host"], "true"])
+    check = " ".join(shlex.quote(x) for x in [SSH, *ssh_opts(), "-O", "check", c["host"]])
+    name = shlex.quote(c["name"])
+    sh = (f"echo 'Connecting to '{name}' ({c['host']})…'; echo; "
+          f"if {check} >/dev/null 2>&1; then echo 'Already connected (the connection is still open).'; elif {ssh}; then echo; "
+          f"echo 'Connected. You can close this window (the connection stays open for {h} h).'; "
+          f"else echo; echo 'Could not connect.'; fi; echo; read -r -p 'Press Enter to close.' _")
+    cmd = terminal_cmd(sh)
+    if cmd:
+        subprocess.Popen(cmd, start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    return cmd is not None
+
+
+def disconnect(c):
+    if bad_host(c["host"]):
+        return
+    subprocess.run([SSH, *ssh_opts(), "-O", "exit", c["host"]], capture_output=True, timeout=10)
+
+
+def slurm_secs(s):
+    """'1-02:03:04' / '02:03:04' / '03:04' -> seconds."""
+    try:
+        d, _, rest = s.rpartition("-")
+        parts = [int(x) for x in rest.split(":")]
+        while len(parts) < 3:
+            parts.insert(0, 0)
+        return (int(d) if d else 0) * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+    except ValueError:
+        return None
+
+
+def slurm_time(s):
+    try:
+        return time.mktime(time.strptime(s, "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, TypeError):
+        return None
+
+
+CLUSTER_EVERY_DEFAULT = 60           # s between queries to a cluster (can be changed per cluster)
+CLUSTER_INFO_EVERY_DEFAULT = 60      # s between refreshes of the cluster status panel (per cluster)
+SLURM_CODE = {"RUNNING": "R", "PENDING": "PD", "CONFIGURING": "CF", "COMPLETING": "CG", "SUSPENDED": "S",
+              "REQUEUED": "RQ", "RESIZING": "RS", "STOPPED": "ST"}
+SLURM_RUN = {"RUNNING", "PENDING", "CONFIGURING", "COMPLETING", "SUSPENDED", "REQUEUED", "RESIZING"}
+SLURM_END = {"COMPLETED": "ok", "CANCELLED": "cancelled", "TIMEOUT": "timeout", "OUT_OF_MEMORY": "out of memory",
+             "NODE_FAIL": "node failure", "PREEMPTED": "preempted", "BOOT_FAIL": "boot failure",
+             "DEADLINE": "deadline"}
+
+
+def slurm_end_text(state, exitcode):
+    st = state.split()[0] if state else "?"
+    if st == "FAILED":
+        return f"error {exitcode.split(':')[0]}" if exitcode else "error"
+    return SLURM_END.get(st, st.lower())
+
+
+def gpu_script(only_mine):
+    """For each job: on which node(s) and GPU number(s) it runs (scontrol show job -d), or the GPUs it asks for."""
+    mine = "grep -F \"UserId=$u(\" | " if only_mine else ""
+    return (f"scontrol show job -d -o 2>/dev/null | {mine}grep -oE '^JobId=[^ ]*|ArrayJobId=[^ ]*|ArrayTaskId=[^ ]*|"
+            f"JobState=[^ ]*|Nodes=[^ ]+ CPU_IDs=[^ ]+ Mem=[^ ]+ GRES(_IDX)?=[^ ]*|TresPerNode=[^ ]*'; ")
+
+
+def parse_gpus(lines):
+    """Output of gpu_script -> {job id as squeue shows it: "g010 · GPU 4" / "wants 2 a100" / ""}."""
+    recs, r = [], None
+    for l in lines:
+        k, _, v = l.strip().partition("=")
+        if k == "JobId":
+            r = dict(id=v, nodes=[]); recs.append(r)
+        elif r is None:
+            continue
+        elif k in ("ArrayJobId", "ArrayTaskId", "JobState", "TresPerNode"):
+            r[k] = v
+        elif k == "Nodes":
+            node = v.split()[0]
+            g = re.search(r"GRES(?:_IDX)?=(\S*)", l)
+            r["nodes"].append((node, g.group(1) if g else ""))
+    out = {}
+    for r in recs:
+        a, t = r.get("ArrayJobId"), r.get("ArrayTaskId")
+        jid = r["id"] if not (a and t) else (f"{a}_{t}" if t.isdigit() else f"{a}_[{t}]")
+        if r.get("JobState") == "RUNNING" or r["nodes"]:
+            parts = []
+            for node, gres in r["nodes"]:
+                for m in re.finditer(r"gpu(?::([^:(,]+))?(?::\d+)?\(IDX:([^)]*)\)", gres):
+                    if m.group(2) not in ("", "N/A"):
+                        parts.append(f"{node} · GPU {m.group(2)}")
+            txt = ", ".join(dict.fromkeys(parts))
+        else:
+            m = re.search(r"gpu(?::([^:,]+))?:(\d+)", r.get("TresPerNode", ""))
+            txt = f"wants {m.group(2)}" + (f" {m.group(1)}" if m.group(1) else "") if m else ""
+        out[jid] = txt
+        if r["id"] != jid:
+            out.setdefault(r["id"], txt)
+    return out
+
+
+def poll_script(since):
+    return (f"u=${{USER:-$(whoami)}}; echo '@@Q'; squeue -u \"$u\" -h -o '%i|%T|%M|%l|%D|%R|%P|%j' 2>&1; "
+            f"echo '@@S'; squeue -u \"$u\" -h -t PD --start -o '%i|%S' 2>/dev/null; "
+            + (f"echo '@@G'; {gpu_script(True)}" if S["show_gpus"] else "") +
+            f"echo '@@A'; sacct -u \"$u\" -S {since} -X -n -P -o JobID,State,Start,End,Elapsed,ExitCode,Partition,JobName 2>&1")
+
+
+def parse_poll(out):
+    """-> (queued/running, finished, {id: estimated start time of queued jobs})."""
+    sec, cur = {"@@Q": [], "@@S": [], "@@A": [], "@@G": []}, None
+    for l in out.splitlines():
+        if l.strip() in sec:
+            cur = l.strip(); continue
+        if cur:
+            sec[cur].append(l)
+    q, a = "\n".join(sec["@@Q"]), "\n".join(sec["@@A"])
+    starts = {}
+    for l in sec["@@S"]:
+        jid, _, st = l.partition("|")
+        t = slurm_time(st.strip())
+        if t:
+            starts[jid.strip()] = t
+    running, hist, warn = [], [], []
+    gpus = parse_gpus(sec["@@G"])
+    for l in q.strip().splitlines():
+        p = l.split("|", 7)
+        if len(p) < 8:
+            warn.append(l.strip()); continue
+        jid, st, used, lim, nodes, reason, part, name = p
+        running.append(dict(id=jid, state=st, used=used, limit=lim, nodes=nodes, reason=reason, part=part, name=name,
+                            gpu=gpus.get(jid, "")))
+    run_ids = {r["id"] for r in running}
+    for l in a.strip().splitlines():
+        p = l.split("|", 7)
+        if len(p) < 8:
+            if l.strip():
+                warn.append(l.strip())
+            continue
+        jid, st, start, end, el, ex, part, name = p
+        endt = slurm_time(end)
+        if jid in run_ids or endt is None or st.split()[0] in SLURM_RUN:
+            continue
+        hist.append(dict(id=jid, state=st, start=slurm_time(start), end=endt, elapsed=slurm_secs(el), exit=ex,
+                         part=part, name=name))
+    if warn and not running and not hist and "not found" in " ".join(warn):
+        raise RuntimeError("does not look like a Slurm cluster: " + warn[0])
+    return running, hist, starts
+
+
+def array_of(jid):
+    """'123_4' / '123_[5-9]' -> '123';  not an array -> None."""
+    return jid.split("_", 1)[0] if "_" in jid else None
+
+
+def array_task_count(jid):
+    """'123_4' -> 1;  '123_[0-9,12%4]' -> 11 (tasks represented by one squeue row)."""
+    m = re.search(r"_\[([^\]]*)\]", jid)
+    if not m:
+        return 1
+    n = 0
+    for part in m.group(1).split("%")[0].split(","):
+        a, _, b = part.partition("-")
+        try:
+            step = 1
+            if ":" in b:
+                b, stp = b.split(":"); step = int(stp)
+            n += (int(b) - int(a)) // step + 1 if b else 1
+        except ValueError:
+            n += 1
+    return n
+
+
+def eff_script(jid):
+    return f"sacct -j {shlex.quote(jid)} -n -P -o JobID,ReqMem,MaxRSS,TotalCPU,AllocCPUS,Elapsed,Timelimit 2>&1"
+
+
+def parse_size(txt, default_unit=""):
+    """'16G' / '4000M' / '123K' / '4000Mc' -> (bytes, 'c'|'n'|'')."""
+    m = re.match(r"^([\d.]+)([KMGTP]?)([cn]?)$", txt.strip())
+    if not m:
+        return None, ""
+    unit = m.group(2) or default_unit
+    return float(m.group(1)) * {"": 1, "K": 2 ** 10, "M": 2 ** 20, "G": 2 ** 30, "T": 2 ** 40, "P": 2 ** 50}[unit], m.group(3)
+
+
+def cpu_secs(txt):
+    """sacct TotalCPU: '1-02:03:04' / '02:03:04' / '03:04.567' -> seconds."""
+    try:
+        d, _, rest = txt.strip().rpartition("-")
+        parts = [float(x) for x in rest.split(":")]
+        while len(parts) < 3:
+            parts.insert(0, 0.0)
+        return (int(d) if d else 0) * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+    except ValueError:
+        return None
+
+
+def parse_eff(out):
+    """seff-like summary: peak memory vs requested, CPU efficiency and time used vs the limit."""
+    rows = [l.split("|") for l in out.strip().splitlines() if l.count("|") >= 6]
+    if not rows:
+        return ""
+    alloc = next((r for r in rows if "." not in r[0]), rows[0])
+    _, reqmem, _, totcpu, ncpu, elapsed, limit = alloc[:7]
+    parts = []
+    rss = [parse_size(r[2])[0] for r in rows if r[2].strip()]
+    rss = max([x for x in rss if x is not None], default=None)
+    req, per = parse_size(reqmem, "M")
+    try:
+        ncpu = int(ncpu)
+    except ValueError:
+        ncpu = 0
+    if req and per == "c" and ncpu:
+        req *= ncpu
+    if rss:
+        parts.append(f"peak memory {fmt_bytes(rss)}" + (f" of {fmt_bytes(req)} requested ({100 * rss / req:.0f} %)" if req else ""))
+    el = slurm_secs(elapsed)
+    tc = cpu_secs(totcpu)
+    if not tc:
+        tc = sum(cpu_secs(r[3]) or 0 for r in rows if "." in r[0]) or None
+    if tc is not None and el and ncpu:
+        parts.append(f"CPU {100 * tc / (el * ncpu):.0f} % of {ncpu} core(s)")
+    lim = slurm_secs(limit) if limit and limit[0].isdigit() else None
+    if el is not None:
+        parts.append(f"time {fmt_dt(el)}" + (f" of {fmt_dt(lim)} ({100 * el / lim:.0f} %)" if lim else ""))
+    return "Efficiency: " + "  ·  ".join(parts) if parts else ""
+
+
+def expand_slurm_path(pat, jid, name, user, workdir):
+    arr, _, task = jid.partition("_")
+
+    def rep(m):
+        k = m.group(2)
+        v = {"j": jid, "x": name, "u": user, "A": arr, "a": task or "4294967294", "%": "%"}.get(k)
+        if v is None:
+            return m.group(0)
+        return v.zfill(int(m.group(1))) if m.group(1) and k in "jAa" else v
+    if not pat:
+        pat = f"slurm-{arr}_{task}.out" if task else f"slurm-{jid}.out"
+    p = re.sub(r"%(\d*)([jxuAa%])", rep, pat)
+    return p if p.startswith("/") or not workdir else workdir.rstrip("/") + "/" + p
+
+
+SBATCH_NOVAL_LONG = {"hold", "parsable", "exclusive", "requeue", "no-requeue", "test-only", "wait", "quiet",
+                     "verbose", "spread-job", "use-min-nodes", "overcommit", "contiguous", "oversubscribe",
+                     "ignore-pbs", "get-user-env", "no-kill", "help", "usage", "version", "reboot"}
+SBATCH_NOVAL_SHORT = set("HhIkOQsvVW")
+SBATCH_KEYS = {"o": "output", "output": "output", "e": "error", "error": "error",
+               "D": "chdir", "chdir": "chdir", "workdir": "chdir", "J": "name", "job-name": "name"}
+
+
+def parse_sbatch_args(toks, find_script=False):
+    """sbatch options -> ({"output"/"error"/"chdir"/"name": value}, batch script or None)."""
+    opts, i = {}, 0
+    while i < len(toks):
+        t = toks[i]; i += 1
+        if t.startswith("--"):
+            k, eq, v = t[2:].partition("=")
+            if not eq and k not in SBATCH_NOVAL_LONG and i < len(toks):
+                v = toks[i]; i += 1
+            if k == "wrap":
+                find_script = False
+        elif t.startswith("-") and len(t) > 1:
+            k, v = t[1], t[2:]
+            if not v and k not in SBATCH_NOVAL_SHORT and i < len(toks):
+                v = toks[i]; i += 1
+        elif find_script:
+            return opts, t
+        else:
+            continue
+        if k in SBATCH_KEYS:
+            opts[SBATCH_KEYS[k]] = v
+    return opts, None
+
+
+def split_submit_line(line):
+    """'sbatch -o x run.slurm' -> (options after sbatch, script)."""
+    try:
+        toks = shlex.split(line)
+    except ValueError:
+        toks = line.split()
+    for n, t in enumerate(toks):
+        if t.rsplit("/", 1)[-1] == "sbatch":
+            return parse_sbatch_args(toks[n + 1:], find_script=True)
+    return {}, None
+
+
+def sbatch_header(text):
+    """#SBATCH lines of a batch script -> options."""
+    toks = []
+    for l in text.splitlines():
+        if l.startswith("#SBATCH"):
+            try:
+                toks += shlex.split(l[7:], comments=True)
+            except ValueError:
+                toks += l[7:].split("#")[0].split()
+    return parse_sbatch_args(toks)[0]
+
+
+def _sections(out):
+    """'@@TAG arg' marker lines split the output of a remote script -> [(tag, arg, [lines])]."""
+    res = []
+    for l in out.splitlines():
+        if l.startswith("@@"):
+            tag, _, arg = l[2:].partition(" ")
+            res.append((tag, arg.strip(), []))
+        elif res:
+            res[-1][2].append(l)
+    return res
+
+
+def resolve_logs(host, pre, ids, live=False, check=False):
+    """Where are the .out/.err of these Slurm jobs?  -> {jid: {"out": path, "err": path}}.
+    Tries, in order: scontrol (live jobs), sacct StdOut/StdErr (recent Slurm), the -o/-e of the sbatch command line
+    (sacct SubmitLine) or the #SBATCH lines of the batch script, and Slurm's default slurm-<id>.out.  With
+    check=True, paths that do not exist are replaced by files in the work folder whose name contains the job id."""
+    q = shlex.quote(",".join(ids))
+    sc = "".join(f"echo '@@SC {j}'; scontrol show job -o {shlex.quote(j)} 2>/dev/null | tr ' ' '\\n' | "
+                 f"grep -E '^(StdOut|StdErr|WorkDir|JobName)='; " for j in ids) if live else ""
+    script = (f"echo \"@@U ${{USER:-$(whoami)}}\"; {sc}"
+              f"if o=$(sacct -j {q} -X -n -P -o JobID,WorkDir,JobName,StdOut,StdErr 2>/dev/null); then "
+              f"echo @@ACCT; printf '%s\\n' \"$o\"; else echo @@ACCT; sacct -j {q} -X -n -P -o JobID,WorkDir,JobName; fi; "
+              f"echo @@SUB; sacct -j {q} -X -n -P -o JobID,SubmitLine 2>/dev/null; true")
+    ok, out, err = ssh_run(host, script, timeout=120, pre=pre)
+    if not ok:
+        raise OSError(err)
+    user, info = "", {}           # jid -> dict(wd, name, out, err, sub)
+    for tag, arg, lines in _sections(out):
+        if tag == "U":
+            user = arg
+        elif tag == "SC":
+            kv = dict(l.split("=", 1) for l in lines if "=" in l)
+            if kv.get("WorkDir"):
+                info.setdefault(arg, {}).update(wd=kv.get("WorkDir", ""), name=kv.get("JobName", ""),
+                                                out=kv.get("StdOut", ""), err=kv.get("StdErr", ""), live=True)
+        elif tag in ("ACCT", "SUB"):
+            for l in lines:
+                f = l.split("|")
+                if f[0] not in ids or len(f) < 2:
+                    continue
+                d = info.setdefault(f[0], {})
+                if tag == "SUB":
+                    d["sub"] = "|".join(f[1:])
+                elif not d.get("live"):
+                    d.update(wd=f[1], name=f[2] if len(f) > 2 else "")
+                    if len(f) >= 5:
+                        d.update(out=f[3], err=f[4])
+    # jobs whose log paths Slurm did not keep: read the options they were submitted with
+    want = {}
+    for jid, d in info.items():
+        if d.get("out"):
+            continue
+        opts, scr = split_submit_line(d.get("sub", ""))
+        d["opts"] = opts
+        if scr and not ("output" in opts and "error" in opts):
+            want[jid] = scr
+    if want:
+        s = "".join(f"echo '@@H {j}'; (cd {shlex.quote(info[j]['wd'] or '.')} && grep -E '^#SBATCH' "
+                    f"{shlex.quote(scr)}) 2>/dev/null; " for j, scr in want.items())
+        ok, out, err = ssh_run(host, s + "true", timeout=60, pre=pre)
+        for tag, arg, lines in _sections(out if ok else ""):
+            if tag == "H" and arg in info:
+                info[arg]["opts"] = {**sbatch_header("\n".join(lines)), **info[arg]["opts"]}
+    res = {}
+    for jid, d in info.items():
+        opts, wd = d.get("opts", {}), d.get("wd", "")
+        if opts.get("chdir"):
+            wd = opts["chdir"] if opts["chdir"].startswith("/") else wd.rstrip("/") + "/" + opts["chdir"]
+        po = d.get("out") or opts.get("output", "")
+        pe = d.get("err") or opts.get("error", "") or po
+        if not po and not wd:
+            continue
+        name = d.get("name") or opts.get("name", "")
+        res[jid] = {"out": expand_slurm_path(po, jid, name, user, wd),
+                    "err": expand_slurm_path(pe, jid, name, user, wd), "wd": wd}
+    if check and res:
+        s = ""
+        for jid, p in res.items():
+            s += (f"echo '@@C {jid}'; for f in {shlex.quote(p['out'])} {shlex.quote(p['err'])}; do "
+                  f"[ -e \"$f\" ] && echo \"OK $f\"; done; ")
+            if p["wd"]:
+                s += (f"find {shlex.quote(p['wd'])} -maxdepth 3 -type f -name {shlex.quote('*' + jid + '*')} "
+                      f"2>/dev/null | head -20 | sed 's/^/F /'; ")
+        ok, out, err = ssh_run(host, s + "true", timeout=60, pre=pre)
+        for tag, jid, lines in _sections(out if ok else ""):
+            if tag != "C" or jid not in res:
+                continue
+            okp = {l[3:] for l in lines if l.startswith("OK ")}
+            found = [l[2:] for l in lines if l.startswith("F ")]
+            p = res[jid]
+            if p["out"] in okp or not found:
+                continue
+            errs = [f for f in found if f.endswith(".err")]
+            outs = [f for f in found if not f.endswith(".err")]
+            p["out"] = (outs or errs)[0]
+            p["err"] = p["err"] if p["err"] in okp else (errs or outs)[0]
+    for p in res.values():
+        p.pop("wd", None)
+    return res
+
+
+def own_log(path, jid):
+    """A log is only deleted if it is an absolute path and its file name contains the job number (otherwise it
+    might be a shared file)."""
+    if not path.startswith("/") or "/../" in path + "/" or "\n" in path:
+        return False
+    base = path.rsplit("/", 1)[-1]
+    return bool(re.search(r"(?<!\d)" + re.escape(jid.partition("_")[0]) + r"(?!\d)", base))
+
+
+class ClusterState:
+    """State of one cluster, updated from a worker thread; the window only reads it."""
+
+    def __init__(self):
+        self.running, self.hist = [], []
+        self.ok, self.err, self.t, self.busy, self.first = None, "", 0.0, False, True
+        self.logs = {}           # (jid, "out"|"err") -> (text, t)
+        self.log_paths = {}      # jid -> {"out": remote path, "err": remote path}
+        self.log_busy = set()
+        self.starts = {}         # queued id -> estimated start time
+        self.eff = {}            # finished id -> efficiency text
+        self.eff_busy = set()
+        self.info, self.info_t, self.info_busy, self.info_err = None, 0.0, False, ""   # cluster status panel
+
+
+# ───────────────────────────── cluster status (nodes, partitions, free CPUs/GPUs, queue) ─────────────────────────────
+def info_script():
+    return INFO_SCRIPT + (f"echo @@G; u=${{USER:-$(whoami)}}; {gpu_script(False)}" if S["show_gpus"] else "")
+
+
+INFO_SCRIPT = (
+    "echo @@PRIV; scontrol show config 2>/dev/null | grep -i '^PrivateData'; "
+    "echo @@NODES; sinfo -h -N -O 'NodeHost:80,Partition:60,StateCompact:30,CPUsState:40,Gres:200,GresUsed:200,"
+    "Memory:20,AllocMem:20' 2>/dev/null | tr -s ' '; "
+    "echo @@PART; sinfo -h -o '%P|%a|%l' 2>/dev/null; "
+    "echo @@Q; squeue -h -o '%P|%T|%u|%i|%M|%l|%D|%R|%j' 2>/dev/null; "
+    "echo \"@@ME ${USER:-$(whoami)}\"; "
+    "echo @@SHARE; sshare -h -P -U -o Account,FairShare 2>/dev/null; ")
+NODE_OK = {"idle", "mix", "mixed", "alloc", "allocated", "comp", "completing"}
+
+
+def gres_gpus(g):
+    """'gpu:a100:2(S:0-1),gpu:t4:1' -> {"a100": 2, "t4": 1}; 'gpu:8' -> {"": 8}; '(null)' -> {}"""
+    out = {}
+    for part in re.split(r",(?![^()]*\))", g or ""):
+        m = re.match(r"gpu(?::([^:(]+))?:(\d+)", part.strip())
+        if m:
+            out[m.group(1) or ""] = out.get(m.group(1) or "", 0) + int(m.group(2))
+    return out
+
+
+def parse_info(out):
+    """Output of INFO_SCRIPT -> dict with the cluster totals and one row per partition (None = unknown)."""
+    sec, cur = {}, None
+    for l in out.splitlines():
+        if l.startswith("@@"):
+            tag, _, arg = l[2:].partition(" ")
+            cur = tag; sec.setdefault(tag, []); sec[tag + "_arg"] = arg.strip(); continue
+        if cur:
+            sec[cur].append(l)
+    me = sec.get("ME_arg", "")
+    private = any("job" in l.lower() for l in sec.get("PRIV", []))
+    parts, order, default, nodes = {}, [], None, {}
+    for l in sec.get("PART", []):
+        f = l.split("|")
+        if len(f) >= 3:
+            name = f[0].rstrip("*")
+            if f[0].endswith("*"):
+                default = name
+            if name not in parts:
+                order.append(name)
+                parts[name] = dict(name=name, avail=f[1], limit=f[2], nodes=0, idle=0, down=0, cpu_free=0, cpu_tot=0,
+                                   gpu_free={}, gpu_tot={}, mem_free=0, run=0, pend=0, my_run=0, my_pend=0)
+
+    def add(d, n):
+        d["nodes"] += 1
+        if n["state"] == "idle":
+            d["idle"] += 1
+        d["cpu_tot"] += n["cpu"][3]
+        for k, v in n["gpu"].items():
+            d["gpu_tot"][k] = d["gpu_tot"].get(k, 0) + v
+        if n["ok"]:
+            d["cpu_free"] += n["cpu"][1]
+            for k, v in n["gpu"].items():
+                d["gpu_free"][k] = d["gpu_free"].get(k, 0) + max(0, v - n["gpu_used"].get(k, 0))
+            d["mem_free"] += max(0, n["mem"] - n["amem"])
+        else:
+            d["down"] += 1
+    for l in sec.get("NODES", []):
+        f = l.split()
+        if len(f) < 8:
+            continue
+        try:
+            cpu = [int(x) for x in f[3].split("/")]
+            mem, amem = int(f[6]), int(f[7])
+        except ValueError:
+            continue
+        st = f[2].rstrip("*~#!%$@+^-").lower()
+        n = dict(state=st, ok=st in NODE_OK, cpu=cpu, gpu=gres_gpus(f[4]), gpu_used=gres_gpus(f[5]), mem=mem, amem=amem)
+        nodes.setdefault(f[0], n)
+        p = f[1].rstrip("*")
+        if p not in parts:
+            order.append(p)
+            parts[p] = dict(name=p, avail="", limit="", nodes=0, idle=0, down=0, cpu_free=0, cpu_tot=0, gpu_free={},
+                            gpu_tot={}, mem_free=0, run=0, pend=0, my_run=0, my_pend=0)
+        add(parts[p], n)
+    total = dict(name="(all)", nodes=0, idle=0, down=0, cpu_free=0, cpu_tot=0, gpu_free={}, gpu_tot={}, mem_free=0,
+                 run=0, pend=0, my_run=0, my_pend=0)
+    for n in nodes.values():
+        add(total, n)
+    queue = []
+    for l in sec.get("Q", []):
+        f = l.split("|")
+        if len(f) < 3:
+            continue
+        p = parts.get(f[0].split(",")[0])
+        r, pd = f[1] == "RUNNING", f[1] == "PENDING"
+        mine = f[2] == me
+        if len(f) >= 9:
+            queue.append(dict(part=f[0], state=f[1], user=f[2], id=f[3], used=f[4], limit=f[5], nodes=f[6],
+                              reason=f[7], name="|".join(f[8:]), mine=mine))
+        for d in [x for x in (p, total) if x]:
+            d["run"] += r; d["pend"] += pd
+            if mine:
+                d["my_run"] += r; d["my_pend"] += pd
+    if private:          # the cluster only shows our own jobs: the totals of all users are unknown
+        for d in list(parts.values()) + [total]:
+            d["run"] = d["pend"] = None
+    share = [l.split("|") for l in sec.get("SHARE", []) if l.count("|") >= 1]
+    rank = {"RUNNING": 0, "COMPLETING": 1, "CONFIGURING": 1, "PENDING": 2}
+    queue.sort(key=lambda q: (rank.get(q["state"], 3), q["part"]))
+    gpus = parse_gpus(sec.get("G", []))
+    for q in queue:
+        q["gpu"] = gpus.get(q["id"], "")
+    return dict(parts=[parts[p] for p in order], total=total, default=default, private=private, queue=queue,
+                have_nodes=bool(nodes), share=[(a, fs) for a, fs in share if a], user=me)
+
+
+# ───────────────────────────── add / edit cluster dialog ─────────────────────────────
+class ClusterDialog(QDialog):
+    def __init__(self, parent, existing=None, taken=()):
+        super().__init__(parent)
+        self.setWindowTitle("Edit cluster" if existing else "Add cluster")
+        self.taken = set(taken)
+        lay = QVBoxLayout(self)
+        form = QFormLayout(); lay.addLayout(form)
+        self.name = QLineEdit(existing["name"] if existing else "")
+        self.name.setPlaceholderText("e.g. Group cluster")
+        self.host = QComboBox(); self.host.setEditable(True)
+        self.host.addItems(ssh_config_hosts())
+        self.host.setCurrentText(existing["host"] if existing else "")
+        self.host.lineEdit().setPlaceholderText("alias from ~/.ssh/config or user@server")
+        self.host.currentTextChanged.connect(self.host_changed)
+        help_ = QLabel("Tracktor uses your normal <b>ssh</b>, so any <i>Host</i> from ~/.ssh/config (the list) or "
+                       "<i>user@server</i> works.  Port, key, ProxyJump, etc. are set in ~/.ssh/config.  If the "
+                       "cluster asks for a password, key passphrase or 2FA, right-click the cluster &gt; "
+                       "<b>Connect…</b> afterwards.")
+        help_.setWordWrap(True)
+        self.result_lbl = QLabel(""); self.result_lbl.setWordWrap(True)
+        test = QPushButton("Test connection"); test.clicked.connect(self.test)
+        form.addRow("Name:", self.name)
+        form.addRow("SSH host:", self.host)
+        self.pre = QLineEdit(existing.get("pre", "") if existing else "")
+        self.pre.setPlaceholderText("optional, e.g.  module load slurm   (only if squeue is not found)")
+        form.addRow("Setup commands:", self.pre)
+        self.every = QSpinBox(); self.every.setRange(10, 3600); self.every.setSuffix(" s")
+        self.every.setValue(int(existing.get("every", CLUSTER_EVERY_DEFAULT)) if existing else CLUSTER_EVERY_DEFAULT)
+        self.every.setToolTip("How often squeue/sacct are queried.  Querying very often loads the login node.")
+        form.addRow("Poll every:", self.every)
+        lay.addWidget(help_)
+        row = QHBoxLayout(); row.addWidget(test, 0, Qt.AlignmentFlag.AlignTop); row.addWidget(self.result_lbl, 1)
+        lay.addLayout(row)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        english_buttons(bb); bb.accepted.connect(self.check_accept); bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+        self.setMinimumWidth(620)
+        self._test_res = None
+        self.timer = QTimer(self); self.timer.timeout.connect(self.poll_test)
+
+    def host_changed(self, h):
+        if not self.name.text().strip() or self.name.text() == getattr(self, "_auto_name", None):
+            self._auto_name = h.split("@")[-1].split(".")[0]
+            self.name.setText(self._auto_name)
+
+    def test(self):
+        host, pre = self.host.currentText().strip(), self.pre.text()
+        if not host:
+            return
+        self.result_lbl.setText("Testing…"); self._test_res = None
+
+        def run():
+            ok, out, err = ssh_run(host, "squeue --version 2>&1 || echo NO_SLURM", timeout=30, pre=pre)
+            self._test_res = (ok, out.strip(), err)
+        threading.Thread(target=run, daemon=True).start()
+        self.timer.start(300)
+
+    def poll_test(self):
+        if self._test_res is None:
+            return
+        self.timer.stop()
+        ok, out, err = self._test_res
+        QTimer.singleShot(0, self.adjustSize)
+        if not ok:
+            self.result_lbl.setText(f"<span style='color:#d04040'>Cannot connect without interaction: {err}</span><br>"
+                                    "That is normal if the cluster asks for a password, key passphrase or 2FA: press "
+                                    "<b>OK</b> and then right-click the cluster &gt; <b>Connect…</b>.")
+        elif "NO_SLURM" in out or "not found" in out:
+            self.result_lbl.setText("<span style='color:#d04040'>Connected, but Slurm (squeue) was not found.</span>")
+        else:
+            self.result_lbl.setText(f"<span style='color:#2a9d3a'>Connected. {out.splitlines()[-1] if out else ''}</span>")
+
+    def check_accept(self):
+        n, h = self.name.text().strip(), self.host.currentText().strip()
+        if not n or not h:
+            tell(self, "Missing data", "Please enter a name and an SSH host."); return
+        if bad_host(h):
+            tell(self, "SSH host", "The SSH host cannot start with «-» or contain spaces."); return
+        if n == "Local" or n in self.taken:
+            tell(self, "Name in use", f"There is already a group called «{n}»."); return
+        self.accept()
+
+    def value(self):
+        return dict(name=self.name.text().strip(), host=self.host.currentText().strip(), pre=self.pre.text().strip(),
+                    every=self.every.value())
+
+
+# ───────────────────────────── dialogs in English ─────────────────────────────
+# Qt's standard buttons (OK, Cancel, Yes…) come translated to the desktop's language; Tracktor is in English.
+def english_buttons(bb):
+    SB = QDialogButtonBox.StandardButton
+    for k, txt in ((SB.Ok, "OK"), (SB.Cancel, "Cancel"), (SB.RestoreDefaults, "Restore defaults"),
+                   (SB.Close, "Close"), (SB.Yes, "Yes"), (SB.No, "No")):
+        b = bb.button(k)
+        if b is not None:
+            b.setText(txt)
+    return bb
+
+
+def ask(parent, title, text):
+    box = QMessageBox(QMessageBox.Icon.Question, title, text, parent=parent)
+    yes = box.addButton("Yes", QMessageBox.ButtonRole.YesRole); box.addButton("No", QMessageBox.ButtonRole.NoRole)
+    box.setDefaultButton(yes); box.exec()
+    return box.clickedButton() is yes
+
+
+def tell(parent, title, text, icon=QMessageBox.Icon.Warning):
+    box = QMessageBox(icon, title, text, parent=parent)
+    box.addButton("OK", QMessageBox.ButtonRole.AcceptRole); box.exec()
+
+
+# ───────────────────────────── settings ─────────────────────────────
+SECTIONS = [   # sections of the settings dialog (left sidebar)
+    ("General", ["tray", "tray_notice", "log_font", "wrap_log", "tail_kb"]),
+    ("Local", ["local_every"]),
+    ("Clusters", ["show_pending", "show_gpus", "close_on_exit"]),
+    ("Notifications", ["notify_local", "notify_cluster", "notify_ok", "notify_start"]),
+]
+
+
+class SettingsDialog(QDialog):
+    def __init__(self, parent, clusters=()):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.resize(780, 440)
+        lay = QVBoxLayout(self)
+        body = QHBoxLayout(); lay.addLayout(body, 1)
+        self.side = QListWidget(); self.side.setFixedWidth(150)
+        self.pages = QStackedWidget()
+        body.addWidget(self.side); body.addWidget(self.pages, 1)
+        self.w, self.cl_vals = {}, {}
+        for title, keys in SECTIONS:
+            page = QWidget(); pl = QVBoxLayout(page); form = QFormLayout(); pl.addLayout(form)
+            form.addRow(QLabel(f"<b>{title}</b>"))
+            if title == "Clusters":
+                if clusters:
+                    # one cluster at a time: pick it in the drop-down, its own settings appear below
+                    self.cl_vals = {c["name"]: {k: cset(c, k) for k in CLUSTER_SETTINGS} for c in clusters}
+                    self.cl_combo = QComboBox(); self.cl_combo.addItems(list(self.cl_vals))
+                    self.cl_combo.setMaximumWidth(260)
+                    form.addRow("Cluster:", self.cl_combo)
+                    self.cl_spins = {}
+                    for k, (dv, label, lo, hi, unit, tip) in CLUSTER_SETTINGS.items():
+                        w = QSpinBox(); w.setRange(lo, hi); w.setSuffix(f" {unit}"); w.setMaximumWidth(140)
+                        w.setToolTip(tip); form.addRow(f"      {label}:", w); self.cl_spins[k] = w
+                    self._cl_cur = None
+                    self.cl_combo.currentTextChanged.connect(self.cluster_picked)
+                    self.cluster_picked(self.cl_combo.currentText())
+                    form.addRow(QLabel(""))
+                    form.addRow(QLabel("<b>All clusters</b>"))
+                else:
+                    form.addRow(QLabel("<i>No clusters yet (add them with the + button).</i>"))
+            for k in keys:
+                d = DEFAULTS[k]
+                if isinstance(d[0], bool):
+                    w = QCheckBox(d[1]); w.setChecked(S[k]); form.addRow(w)
+                else:
+                    w = QSpinBox(); w.setRange(d[2], d[3]); w.setValue(S[k]); w.setSuffix(f" {d[4]}")
+                    w.setMaximumWidth(140); form.addRow(d[1] + ":", w)
+                self.w[k] = w
+            pl.addStretch(1)
+            self.pages.addWidget(page); self.side.addItem(title)
+        self.side.currentRowChanged.connect(self.pages.setCurrentIndex)
+        self.side.setCurrentRow(0)
+        self.w["tray_notice"].setEnabled(S["tray"])
+        self.w["tray"].toggled.connect(self.w["tray_notice"].setEnabled)
+        self.w["notify_ok"].setEnabled(S["notify_local"] or S["notify_cluster"])
+        for k in ("notify_local", "notify_cluster"):
+            self.w[k].toggled.connect(lambda _: self.w["notify_ok"].setEnabled(
+                self.w["notify_local"].isChecked() or self.w["notify_cluster"].isChecked()))
+        note = QLabel(f"<small>Saved in {SETTINGS_FILE.replace(os.path.expanduser('~'), '~')} "
+                      f"(per-cluster settings in {CLUSTERS_FILE.replace(os.path.expanduser('~'), '~')}).</small>")
+        note.setWordWrap(True); lay.addWidget(note)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+                              | QDialogButtonBox.StandardButton.RestoreDefaults)
+        english_buttons(bb); bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
+        bb.button(QDialogButtonBox.StandardButton.RestoreDefaults).clicked.connect(self.defaults)
+        lay.addWidget(bb)
+
+    def defaults(self):
+        for k, d in DEFAULTS.items():
+            (self.w[k].setChecked if isinstance(d[0], bool) else self.w[k].setValue)(d[0])
+        for v in self.cl_vals.values():
+            v.update({k: d[0] for k, d in CLUSTER_SETTINGS.items()})
+        if self.cl_vals:
+            self._cl_cur = None; self.cluster_picked(self.cl_combo.currentText())
+
+    def cluster_picked(self, name):
+        self.save_cluster_fields()
+        self._cl_cur = name
+        if name in self.cl_vals:
+            for k, w in self.cl_spins.items():
+                w.setValue(self.cl_vals[name][k])
+
+    def save_cluster_fields(self):
+        if self._cl_cur in self.cl_vals:
+            self.cl_vals[self._cl_cur].update({k: w.value() for k, w in self.cl_spins.items()})
+
+    def values(self):
+        return {k: (w.isChecked() if isinstance(w, QCheckBox) else w.value()) for k, w in self.w.items()}
+
+    def cluster_values(self):
+        """-> {cluster name: {setting: value}} (see CLUSTER_SETTINGS)"""
+        if self.cl_vals:
+            self.save_cluster_fields()
+        return self.cl_vals
+
+
+# ───────────────────────────── log: error highlighting ─────────────────────────────
+class LogHighlighter(QSyntaxHighlighter):
+    """Error lines in red and warnings in orange (Traceback, ...Error, nan, Killed, out of memory, ...)."""
+    ERR = re.compile(r"Traceback|Error\b|ERROR|Exception|\bnan\b|\bNaN\b|FAILED|Killed|[Oo]ut of memory|\bOOM\b|"
+                     r"Segmentation fault|core dumped|slurmstepd: error|DUE TO TIME LIMIT|CANCELLED AT")
+    WARN = re.compile(r"[Ww]arning|WARNING|\bWARN\b")
+
+    def __init__(self, doc):
+        super().__init__(doc)
+        self.err, self.warn = QTextCharFormat(), QTextCharFormat()
+        self.err.setForeground(QColor("#e05050")); self.warn.setForeground(QColor("#d08000"))
+
+    def highlightBlock(self, text):
+        if self.ERR.search(text):
+            self.setFormat(0, len(text), self.err)
+        elif self.WARN.search(text):
+            self.setFormat(0, len(text), self.warn)
+
+
+# ───────────────────────────── system tray ─────────────────────────────
+def tray_icon(n):
+    """Tray icon with the number of running jobs in a red badge."""
+    base = app_icon()
+    if not base.isNull():
+        pm = base.pixmap(64, 64)
+    else:
+        pm = QPixmap(64, 64); pm.fill(QColor(0, 0, 0, 0))
+        p = QPainter(pm); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QColor("#2e7d32")); p.setPen(Qt.PenStyle.NoPen); p.drawRoundedRect(4, 4, 56, 56, 12, 12)
+        p.end()
+    if n:
+        p = QPainter(pm); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QColor("#d04040")); p.setPen(Qt.PenStyle.NoPen); p.drawEllipse(26, 26, 38, 38)
+        f = QFont(); f.setBold(True); f.setPixelSize(24 if n < 10 else 18); p.setFont(f); p.setPen(QColor("white"))
+        p.drawText(26, 26, 38, 38, Qt.AlignmentFlag.AlignCenter, str(n) if n < 100 else "99+")
+        p.end()
+    return QIcon(pm)
+
+
+def taskbar_count(n):
+    """Number on the launcher / taskbar icon (KDE Plasma, Ubuntu dock…: the Unity LauncherEntry D-Bus API)."""
+    if QDBusConnection is None:
+        return
+    try:
+        msg = QDBusMessage.createSignal("/com/canonical/unity/launcherentry/tracktor",
+                                        "com.canonical.Unity.LauncherEntry", "Update")
+        msg.setArguments(["application://tracktor.desktop", {"count": n, "count-visible": n > 0}])
+        QDBusConnection.sessionBus().send(msg)
+    except Exception:
+        pass
+
+
+# ───────────────────────────── main window ─────────────────────────────
+def tree(headers):
+    t = QTreeWidget(); t.setHeaderLabels(headers); t.setUniformRowHeights(True)
+    t.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+    for i in range(len(headers)):
+        t.header().setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+    t.header().setStretchLastSection(True)       # the last visible column takes the remaining space
+    t.setStyleSheet("QTreeView::item { padding-right: 14px; }")    # room between columns
+    t.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+    t._layout, t._items, t._groups = None, {}, {}
+    t._color_col, t._xcols, t._hover = len(headers) - 1, (), None
+    t.setMouseTracking(True)
+    return t
+
+
+NO_SEL = "Click a job to see its output  (double click: open it in a new tab)"
+
+
+class Main(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(APP)
+        self.setWindowIcon(app_icon())
+        self.resize(1400, 760)
+        self.sel = None                       # payload of the selected job
+        self.clusters = load_clusters()
+        self.cstate = {c["name"]: ClusterState() for c in self.clusters}
+        self.open_groups = set()              # (tab, group) expanded; everything starts collapsed
+        self.open_arrays = set()              # (tab, key) of expanded Slurm arrays
+        self.prev_ticks = {}                  # local job -> (CPU ticks, time) to compute CPU %
+        mono = QFont("Monospace"); mono.setStyleHint(QFont.StyleHint.Monospace)
+
+        self.status = QLabel()
+        add = QPushButton("+"); add.setToolTip("Add a Slurm cluster (over SSH)"); add.setFixedWidth(36)
+        add.clicked.connect(self.add_cluster)
+        gear = QPushButton("⚙"); gear.setToolTip("Settings"); gear.setFixedWidth(36)
+        gear.clicked.connect(self.open_settings)
+        top = QHBoxLayout(); top.addWidget(self.status, 1); top.addWidget(add); top.addWidget(gear)
+
+        self.tabs = QTabWidget()
+        # "Running": the local table (with its column bar) on top, the clusters table (with its own) below.
+        cols = ["Job", "Time", "RAM", "CPU", "GPU", "State", "Est. start", "Partition"]
+        self.run_l, self.run_c = tree(cols), tree(cols)
+        self.run_l.headerItem().setToolTip(2, "Memory (RSS) of the job and all its child processes")
+        self.run_l.headerItem().setToolTip(3, f"CPU cores the job keeps busy (1.0 = one core at 100 %); "
+                                              f"this machine has {os.cpu_count()}")
+        self.run_l.headerItem().setToolTip(4, "GPU memory used by the job (nvidia-smi); — = it is not using the GPU")
+        self.run_c.header().moveSection(7, 1)     # clusters: Job · Partition · Time · State · Est. start
+        for t, hide in ((self.run_l, [6, 7]), (self.run_c, [2, 3, 4])):
+            t.setFont(mono); t._color_col = 5
+            for c in hide:
+                t.setColumnHidden(c, True)
+        run_top = QWidget(); rl0 = QVBoxLayout(run_top); rl0.setContentsMargins(0, 0, 0, 0); rl0.setSpacing(6)
+        rl0.addWidget(self.run_l); rl0.addWidget(self.run_c, 1)
+        # cluster status panel (right-click a cluster > Show cluster status): one tab per cluster, hidden when empty
+        self.cinfo = QTabWidget(); self.cinfo.setTabsClosable(True); self.cinfo.setDocumentMode(True)
+        self.cinfo.tabCloseRequested.connect(self.close_cluster_info); self.cinfo.hide()
+        self.run_split = QSplitter(Qt.Orientation.Vertical); self.run_split.setChildrenCollapsible(False)
+        self.run_split.addWidget(run_top); self.run_split.addWidget(self.cinfo)
+        self.tabs.addTab(self.run_split, "Running")
+        hist_w = QWidget(); hl = QVBoxLayout(hist_w); hl.setContentsMargins(0, 0, 0, 0)
+        hcols = ["Job", "Partition", "Ended", "Duration", "Result"]
+        self.hist_l, self.hist_c = tree(hcols), tree(hcols)
+        self.hist_l.setColumnHidden(1, True)              # local jobs have no partition
+        self.hist_l.setFont(mono); self.hist_c.setFont(mono)
+        # ✓ / 🗑 buttons floating at the right end of the row (or group) under the mouse
+        self.hover_box = None; self._hover = None
+        for t in (self.hist_l, self.hist_c):
+            t.viewport().installEventFilter(self)
+            t.verticalScrollBar().valueChanged.connect(lambda _: self.unhover())
+        clear = QPushButton("✓  Clear history"); clear.clicked.connect(lambda: self.clear_history(False))
+        clear.setToolTip("Remove all finished jobs from the list.  Their logs are kept.")
+        wipe = QPushButton("🗑  Delete history"); wipe.clicked.connect(lambda: self.clear_history(True))
+        wipe.setToolTip("Remove all finished jobs from the list AND delete their logs: temporary local logs and the "
+                        ".out/.err on the clusters.  Logs saved with -l are never deleted.")
+        hbtns = QHBoxLayout(); hbtns.addWidget(clear); hbtns.addWidget(wipe)
+        self.hsearch = QLineEdit(); self.hsearch.setPlaceholderText("Search the history (name, job id…)")
+        self.hsearch.setClearButtonEnabled(True); self.hsearch.textChanged.connect(lambda _: self.refresh())
+        self.hfilter = QComboBox(); self.hfilter.addItems(["All", "Errors only", "OK only"])
+        self.hfilter.currentIndexChanged.connect(lambda _: self.refresh())
+        sbar = QHBoxLayout(); sbar.addWidget(self.hsearch, 1); sbar.addWidget(self.hfilter)
+        hl.addLayout(sbar); hl.addWidget(self.hist_l); hl.addWidget(self.hist_c, 1); hl.addLayout(hbtns)
+        self.tabs.addTab(hist_w, "History")
+        for t, name in ((self.run_l, "run"), (self.run_c, "run"), (self.hist_l, "hist"), (self.hist_c, "hist")):
+            t.currentItemChanged.connect(lambda it, _, t=t: self.on_current(t, it))
+            t.itemClicked.connect(lambda it, col: self.open_info(it.data(0, Qt.ItemDataRole.UserRole)))
+            t.itemDoubleClicked.connect(lambda it, col: self.open_info(it.data(0, Qt.ItemDataRole.UserRole), new=True))
+            t.customContextMenuRequested.connect(lambda pos, t=t: self.context_menu(t, pos))
+            t.itemCollapsed.connect(lambda it, n=name: self.on_fold(n, it, True))
+            t.itemExpanded.connect(lambda it, n=name: self.on_fold(n, it, False))
+            t.itemClicked.connect(self.group_clicked)
+            t.setExpandsOnDoubleClick(False)
+        self.tabs.currentChanged.connect(lambda _: self.refresh())
+
+        self.title = QLabel(NO_SEL); self.title.setWordWrap(True)
+        self.title.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.out = QPlainTextEdit(); self.out.setReadOnly(True); self.out.setFont(mono)
+        self.hl = LogHighlighter(self.out.document())
+        # open logs as tabs, like a browser: click = show it in the current tab, double click = in a new tab
+        self.logtabs = QTabBar(); self.logtabs.setTabsClosable(True); self.logtabs.setMovable(True)
+        self.logtabs.setExpanding(False); self.logtabs.setDocumentMode(True); self.logtabs.setUsesScrollButtons(True)
+        self.logtabs.setElideMode(Qt.TextElideMode.ElideMiddle)
+        self.logtabs.currentChanged.connect(self.tab_changed)
+        self.logtabs.tabCloseRequested.connect(self.close_tab)
+        self.tabdata, self._tab_seq, self._cur_tab, self._last_replace = {}, 0, None, None
+        QShortcut(QKeySequence("Ctrl+W"), self, activated=lambda: self.close_tab(self.logtabs.currentIndex()))
+        # log search (Ctrl+F): Enter next, Shift+Enter previous, Esc close
+        self.findbar = QWidget(); fb = QHBoxLayout(self.findbar); fb.setContentsMargins(0, 0, 0, 0)
+        self.find_edit = QLineEdit(); self.find_edit.setPlaceholderText("Search the log   (Enter: next · "
+                                                                        "Shift+Enter: previous · Esc: close)")
+        self.find_count = QLabel("")
+        fb.addWidget(self.find_edit, 1); fb.addWidget(self.find_count)
+        for txt, tip, fn in (("↑", "Previous (Shift+Enter)", lambda: self.find_step(-1)),
+                             ("↓", "Next (Enter)", lambda: self.find_step(1)), ("✕", "Close (Esc)", self.close_find)):
+            b = QPushButton(txt); b.setFixedWidth(32); b.setToolTip(tip); b.clicked.connect(fn); fb.addWidget(b)
+        self.findbar.hide()
+        self.matches, self.find_idx = [], -1
+        self.find_edit.textChanged.connect(lambda _: self.update_find(jump=True))
+        self.find_edit.returnPressed.connect(lambda: self.find_step(1))
+        QShortcut(QKeySequence("Shift+Return"), self.find_edit, activated=lambda: self.find_step(-1),
+                  context=Qt.ShortcutContext.WidgetShortcut)
+        QShortcut(QKeySequence("Escape"), self.findbar, activated=self.close_find,
+                  context=Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        QShortcut(QKeySequence.StandardKey.Find, self, activated=self.open_find)
+
+        self.stream, self._title_paths, self._title_eff = "out", None, ""
+        self.out_btn = QPushButton("Output (.out)"); self.err_btn = QPushButton("Errors (.err)")
+        grp = QButtonGroup(self); grp.setExclusive(True)
+        for b, st in ((self.out_btn, "out"), (self.err_btn, "err")):
+            b.setCheckable(True); b.setVisible(False); grp.addButton(b)
+            b.clicked.connect(lambda _, st=st: self.set_stream(st))
+        self.out_btn.setChecked(True)
+        head = QHBoxLayout(); head.addWidget(self.title, 1)
+        head.addWidget(self.out_btn, 0, Qt.AlignmentFlag.AlignTop); head.addWidget(self.err_btn, 0, Qt.AlignmentFlag.AlignTop)
+        right = QWidget(); rl = QVBoxLayout(right); rl.setContentsMargins(0, 0, 0, 0)
+        rl.addWidget(self.logtabs); rl.addLayout(head); rl.addWidget(self.findbar); rl.addWidget(self.out)
+
+        split = QSplitter(); split.addWidget(self.tabs); split.addWidget(right); split.setSizes([700, 550])
+        central = QWidget(); cl = QVBoxLayout(central); cl.addLayout(top); cl.addWidget(split, 1)
+        self.setCentralWidget(central)
+
+        self.tray, self._quitting, self._tray_n = None, False, None
+        self.timer = QTimer(self); self.timer.timeout.connect(self.refresh); self.timer.start(S["local_every"] * 1000)
+        self.prev_local, self.prev_cluster = None, {}    # to notify jobs that start / finish
+        self.apply_settings()
+        self.refresh()
+
+    # ── clusters: background queries ──
+    def cluster(self, name):
+        return next((c for c in self.clusters if c["name"] == name), None)
+
+    def poll_cluster(self, c, force=False):
+        s = self.cstate.setdefault(c["name"], ClusterState())
+        if s.busy or (not force and time.time() - s.t < c.get("every", CLUSTER_EVERY_DEFAULT)):
+            return
+        s.busy = True
+        since = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(max(time.time() - cset(c, "hist_days") * 86400,
+                                                                       c.get("cleared", 0))))
+
+        def run():
+            try:
+                ok, out, err = ssh_run(c["host"], poll_script(since), pre=c.get("pre", ""))
+                if ok:
+                    s.running, s.hist, s.starts = parse_poll(out)
+                s.ok, s.err = ok, ("" if ok else err)
+            except Exception as e:
+                s.ok, s.err = False, str(e)
+            s.t, s.busy, s.first = time.time(), False, False
+        threading.Thread(target=run, daemon=True).start()
+
+    def fetch_cluster_log(self, name, jid, running, stream):
+        c, s = self.cluster(name), self.cstate.get(name)
+        k = (jid, stream)
+        if not c or not s or k in s.log_busy:
+            return
+        old = s.logs.get(k)
+        if old and (not running or time.time() - old[1] < cset(c, "cluster_log_every")):
+            return
+        s.log_busy.add(k)
+
+        def run():
+            try:
+                paths = s.log_paths.get(jid)
+                if not paths:
+                    try:
+                        paths = resolve_logs(c["host"], c.get("pre", ""), [jid], live=running, check=True).get(jid)
+                    except OSError as e:
+                        s.logs[k] = (f"(no connection to {name}: {e})", time.time()); return
+                    if not paths:
+                        s.logs[k] = ("(log not found: Slurm no longer remembers this job)", time.time())
+                        return
+                    s.log_paths[jid] = paths
+                f = shlex.quote(paths[stream])
+                ok, out, err = ssh_run(c["host"], f"if [ -e {f} ]; then tail -c {tail_bytes()} {f} 2>&1; "
+                                       f"else echo @@NOLOG; fi", timeout=60, pre=c.get("pre", ""))
+                if not ok:
+                    text = f"(no connection to {name}: {err})"
+                elif out.strip() == "@@NOLOG":
+                    s.log_paths.pop(jid, None)     # look for it again next time (it may not have been created yet)
+                    text = (f"(this log does not exist on {name}: it was deleted or moved, or the job has not "
+                            f"written it yet)\n\n{paths[stream]}")
+                else:
+                    text = clean_log(out)
+                s.logs[k] = (text, time.time())
+            finally:
+                s.log_busy.discard(k)
+        threading.Thread(target=run, daemon=True).start()
+
+    def fetch_eff(self, name, jid):
+        """Efficiency (like seff) of a finished job, in the background and only once."""
+        c, s = self.cluster(name), self.cstate.get(name)
+        if not c or not s or jid in s.eff or jid in s.eff_busy:
+            return
+        s.eff_busy.add(jid)
+
+        def run():
+            try:
+                ok, out, err = ssh_run(c["host"], eff_script(jid), timeout=30, pre=c.get("pre", ""))
+                if ok:
+                    s.eff[jid] = parse_eff(out) or "Efficiency: Slurm has no data for this job"
+            finally:
+                s.eff_busy.discard(jid)
+        threading.Thread(target=run, daemon=True).start()
+
+    def cluster_paths(self, info):
+        s = self.cstate.get(info.get("cluster")) if info else None
+        return s.log_paths.get(info["id"]) if s else None
+
+    def set_stream_buttons(self, info):
+        """Output/errors buttons: only for cluster jobs; errors disabled if both go to the same file."""
+        is_cl = bool(info) and info["kind"] == "cluster"
+        self.out_btn.setVisible(is_cl); self.err_btn.setVisible(is_cl)
+        if not is_cl:
+            return
+        paths = self.cluster_paths(info)
+        same = bool(paths) and paths["out"] == paths["err"]
+        self.err_btn.setEnabled(not same)
+        self.err_btn.setToolTip("This job writes its errors to the same file as its output (Slurm's default when "
+                                "--error is not used)" if same else (paths["err"] if paths else ""))
+        self.out_btn.setToolTip(paths["out"] if paths else "")
+        stream = "out" if same else self.stream
+        (self.out_btn if stream == "out" else self.err_btn).setChecked(True)
+
+    def set_stream(self, stream):
+        if stream != self.stream:
+            self.stream = stream
+            if self._cur_tab in self.tabdata:
+                self.tabdata[self._cur_tab]["stream"] = stream
+            if self.sel:
+                self.select(self.sel)
+
+    # ── selection and log ──
+    def select(self, info):
+        if not info:
+            return
+        self.sel = info
+        extra = ""
+        if info["kind"] == "local":
+            where = info["log"]
+        elif info["kind"] == "array":
+            where = f"{info['cluster']}  ·  array {info['id']}"
+        else:
+            paths = self.cluster_paths(info)
+            where = f"{info['cluster']}  ·  job {info['id']}" + (f"  ·  {paths[self.eff_stream()]}" if paths else "")
+            if not info.get("running"):
+                self.fetch_eff(info["cluster"], info["id"])
+                st = self.cstate.get(info["cluster"])
+                extra = (st.eff.get(info["id"]) if st else "") or ""
+        self._title_paths = self.cluster_paths(info) if info["kind"] == "cluster" else None
+        self._title_eff = extra
+        self.title.setText(f"<b>{html.escape(info['label'])}</b>  —  {html.escape(where)}<br>"
+                           f"<small>{html.escape(info.get('cmd', ''))}</small>"
+                           + (f"<br><small>{extra}</small>" if extra else ""))
+        self.set_stream_buttons(info)
+        self.show_log(force=True)
+
+    def eff_stream(self):
+        paths = self.cluster_paths(self.sel)
+        return "out" if (paths and paths["out"] == paths["err"]) else self.stream
+
+    def current_log_text(self):
+        i = self.sel
+        if i["kind"] == "local":
+            return read_tail(i["log"])
+        if i["kind"] == "array":
+            return (f"Array {i['id']} ({len(i.get('ids', []))} tasks in this list).\n"
+                    "Expand it and click a task to see its log.")
+        st = self.eff_stream()
+        self.fetch_cluster_log(i["cluster"], i["id"], i.get("running", False), st)
+        s = self.cstate.get(i["cluster"])
+        got = s.logs.get((i["id"], st)) if s else None
+        return got[0] if got else "(reading the log from the cluster…)"
+
+    def show_log(self, force=False):
+        if not self.sel:
+            return
+        sb = self.out.verticalScrollBar()
+        at_bottom = sb.value() >= sb.maximum() - 3
+        txt = self.current_log_text()
+        if force or txt != self.out.toPlainText():
+            pos = sb.value()
+            self.out.setPlainText(txt)
+            if self.searching():                 # while searching: do not jump to the end, stay where we were
+                if not force:
+                    sb.setValue(pos)
+                self.update_find(jump=force)
+            elif force or at_bottom:
+                self.out.moveCursor(QTextCursor.MoveOperation.End)
+            else:
+                sb.setValue(pos)
+        if self.sel["kind"] == "cluster":
+            st = self.cstate.get(self.sel["cluster"])
+            eff = (st.eff.get(self.sel["id"]) if st and not self.sel.get("running") else "") or ""
+            if self.cluster_paths(self.sel) != self._title_paths or eff != self._title_eff:
+                self.select(self.sel)   # paths or efficiency are now known: update title and buttons
+
+    # ── log search ──
+    def searching(self):
+        return self.findbar.isVisible() and bool(self.find_edit.text())
+
+    def open_find(self):
+        self.findbar.show(); self.find_edit.setFocus(); self.find_edit.selectAll()
+        self.update_find(jump=True)
+
+    def close_find(self):
+        self.findbar.hide(); self.matches, self.find_idx = [], -1
+        self.out.setExtraSelections([]); self.find_count.setText("")
+
+    def update_find(self, jump=False):
+        q = self.find_edit.text()
+        if not q or not self.findbar.isVisible():
+            self.matches = []; self.out.setExtraSelections([]); self.find_count.setText(""); return
+        doc = self.out.toPlainText().lower()
+        self.matches = [m.start() for m in re.finditer(re.escape(q.lower()), doc)][:5000]
+        if not self.matches:
+            self.find_idx = -1; self.out.setExtraSelections([])
+            self.find_count.setText("no matches"); return
+        if jump or self.find_idx < 0:
+            top = self.out.cursorForPosition(self.out.viewport().rect().topLeft()).position()
+            self.find_idx = next((i for i, p in enumerate(self.matches) if p >= top), 0)
+            self.go_match(self.find_idx)
+        else:
+            self.find_idx = min(self.find_idx, len(self.matches) - 1)
+            self.paint_matches()
+
+    def find_step(self, d):
+        if not self.matches:
+            self.update_find(jump=True); return
+        self.go_match((self.find_idx + d) % len(self.matches))
+
+    def go_match(self, i):
+        self.find_idx = i
+        n = len(self.find_edit.text()); cur = QTextCursor(self.out.document())
+        cur.setPosition(self.matches[i]); cur.setPosition(self.matches[i] + n, QTextCursor.MoveMode.KeepAnchor)
+        self.out.setTextCursor(cur); self.out.ensureCursorVisible()
+        self.paint_matches()
+
+    def paint_matches(self):
+        n = len(self.find_edit.text()); sels = []
+        for i, p in enumerate(self.matches[:2000]):
+            sel = QTextEdit.ExtraSelection(); cur = QTextCursor(self.out.document())
+            cur.setPosition(p); cur.setPosition(p + n, QTextCursor.MoveMode.KeepAnchor); sel.cursor = cur
+            sel.format.setBackground(QColor("#ff9632" if i == self.find_idx else "#f5e663"))
+            sel.format.setForeground(QColor("black"))
+            sels.append(sel)
+        self.out.setExtraSelections(sels)
+        self.find_count.setText(f"{self.find_idx + 1}/{len(self.matches)}")
+
+    # ── building the trees ──
+    # Groups open/close by clicking their header (▸/▾).  Everything starts collapsed.
+    def group_clicked(self, it, col=0):
+        p = it.data(0, Qt.ItemDataRole.UserRole)
+        is_group = it.data(0, Qt.ItemDataRole.UserRole + 1) and not p
+        if (is_group or (p and p.get("kind") == "array")) and col not in it.treeWidget()._xcols:
+            it.setExpanded(not it.isExpanded())     # -> on_fold
+
+    def on_current(self, t, it):
+        """Selection: "Running" has two tables; selecting in one clears the selection of the other."""
+        pairs = {self.run_l: self.run_c, self.run_c: self.run_l, self.hist_l: self.hist_c, self.hist_c: self.hist_l}
+        if it is not None and t in pairs:
+            other = pairs[t]
+            other.blockSignals(True); other.setCurrentItem(None); other.clearSelection(); other.blockSignals(False)
+        if it is not None:
+            self.open_info(it.data(0, Qt.ItemDataRole.UserRole))
+
+    # ── log tabs (like a browser): click = open in the current tab, double click = open in a new tab; a job that
+    # is already open in a tab just brings that tab to the front ──
+    @staticmethod
+    def tab_title(info):
+        return info["label"] if info["kind"] == "local" else f"{info['label']}  [{info['id']}]"
+
+    @staticmethod
+    def tab_tip(info):
+        if info["kind"] == "local":
+            return f"{info['label']}\n{info.get('log', '')}"
+        return f"{info['label']}\n{info['cluster']}  ·  {'array' if info['kind'] == 'array' else 'job'} {info['id']}"
+
+    def tab_index(self, tid):
+        return next((i for i in range(self.logtabs.count()) if self.logtabs.tabData(i) == tid), -1)
+
+    def find_tab(self, key):
+        return next((i for i in range(self.logtabs.count())
+                     if self.tabdata[self.logtabs.tabData(i)]["info"].get("key") == key), -1)
+
+    def set_tab_info(self, i, info):
+        self.logtabs.setTabText(i, self.tab_title(info)); self.logtabs.setTabToolTip(i, self.tab_tip(info))
+
+    def open_info(self, info, new=False):
+        if not info:
+            return
+        key, cur = info.get("key"), self.logtabs.currentIndex()
+        i = self.find_tab(key)
+        lr = self._last_replace
+        if (new and lr and i == cur >= 0 and lr[0] == self.logtabs.tabData(cur) and lr[2] == key
+                and time.time() - lr[3] < 2):
+            # the first click of this double click put the job in the current tab: give that tab its log back
+            self.tabdata[lr[0]].update(lr[1]); self.set_tab_info(cur, lr[1]["info"])
+            self._last_replace, i = None, -1
+        elif i >= 0:
+            if i != cur:
+                self.logtabs.setCurrentIndex(i)          # -> tab_changed
+            return
+        if new or cur < 0:
+            self._tab_seq += 1; tid = self._tab_seq
+            self.tabdata[tid] = dict(info=info, stream="out", scroll=None)
+            self._last_replace = None
+            self.logtabs.blockSignals(True)
+            i = self.logtabs.addTab(""); self.logtabs.setTabData(i, tid); self.set_tab_info(i, info)
+            self.logtabs.blockSignals(False)
+        else:
+            self.save_scroll()
+            i, tid = cur, self.logtabs.tabData(cur)
+            self._last_replace = (tid, dict(self.tabdata[tid]), key, time.time())
+            self.tabdata[tid] = dict(info=info, stream="out", scroll=None)
+            self.set_tab_info(i, info)
+        if i != self.logtabs.currentIndex():
+            self.logtabs.blockSignals(True); self.logtabs.setCurrentIndex(i); self.logtabs.blockSignals(False)
+            self.save_scroll()
+        self._cur_tab = None
+        self.activate(i)
+
+    def save_scroll(self):
+        d = self.tabdata.get(self._cur_tab)
+        if d:
+            sb = self.out.verticalScrollBar()
+            d["scroll"] = None if sb.value() >= sb.maximum() - 3 else sb.value()
+
+    def tab_changed(self, i):
+        tid = self.logtabs.tabData(i) if i >= 0 else None
+        if tid is not None and tid == self._cur_tab:
+            return                                       # same tab, only its position changed
+        self.save_scroll()
+        self.activate(i)
+
+    def activate(self, i):
+        if i < 0 or not self.logtabs.count():
+            self._cur_tab = None; self.clear_selection(); return
+        tid = self.logtabs.tabData(i); d = self.tabdata[tid]
+        self._cur_tab = tid; self.stream = d["stream"]
+        self.select(d["info"])
+        if d["scroll"] is not None:
+            self.out.verticalScrollBar().setValue(d["scroll"])
+
+    def close_tab(self, i):
+        if i < 0:
+            return
+        tid = self.logtabs.tabData(i)
+        if tid == self._cur_tab:
+            self._cur_tab = None
+        self.tabdata.pop(tid, None)
+        self._last_replace = None
+        self.logtabs.removeTab(i)                        # -> tab_changed (another tab, or none)
+        if not self.logtabs.count():
+            self._cur_tab = None; self.clear_selection()
+
+    def close_log_tabs(self, pred):
+        for i in reversed(range(self.logtabs.count())):
+            if pred(self.tabdata[self.logtabs.tabData(i)]["info"]):
+                self.close_tab(i)
+
+    def refresh_tabs(self):
+        """Keep the jobs shown in the tabs up to date (e.g. a running job that has just finished)."""
+        for i in range(self.logtabs.count()):
+            tid = self.logtabs.tabData(i); d = self.tabdata[tid]; key = d["info"].get("key")
+            p = None
+            for t in (self.run_l, self.run_c, self.hist_l, self.hist_c):
+                it = t._items.get(key)
+                p = it.data(0, Qt.ItemDataRole.UserRole) if it is not None else None
+                if p:
+                    break
+            if not p or p == d["info"]:
+                continue
+            if d["info"].get("running") and not p.get("running") and p["kind"] == "cluster":
+                s = self.cstate.get(p["cluster"])         # it has just finished: read its log once more
+                if s:
+                    s.logs.pop((p["id"], "out"), None); s.logs.pop((p["id"], "err"), None)
+            d["info"] = p; self.set_tab_info(i, p)
+            if tid == self._cur_tab:
+                self.sel = p
+
+    def fit_local(self):
+        self.fit_top(self.run_l); self.fit_top(self.hist_l)
+
+    def fit_top(self, t):
+        """The local table takes just the height of its rows (up to half the tab); the clusters table the rest."""
+        if not self.clusters:
+            t.setMinimumHeight(0); t.setMaximumHeight(16777215); return
+        rows, stack = 0, [t.invisibleRootItem()]
+        while stack:
+            it = stack.pop()
+            for i in range(it.childCount()):
+                ch = it.child(i); rows += 1
+                if ch.isExpanded():
+                    stack.append(ch)
+        rowh = t.sizeHintForRow(0) if t.topLevelItemCount() else t.fontMetrics().height() + 6
+        rowh = max(rowh, t.fontMetrics().height() + 4)
+        h = t.header().sizeHint().height() + max(rows, 1) * rowh + 2 * t.frameWidth() + 4
+        h = min(h, max(120, int(self.tabs.height() * 0.5)))
+        t.setMinimumHeight(h); t.setMaximumHeight(h)
+
+    def on_fold(self, tab, it, folded):
+        g = it.data(0, Qt.ItemDataRole.UserRole + 1)
+        if g:                                       # every group opens and closes on its own
+            (self.open_groups.discard if folded else self.open_groups.add)((tab, g))
+            self.set_group_text(it)
+            if it.treeWidget() in (self.run_l, self.hist_l):
+                self.fit_local()
+            self.place_hover()
+            return
+        k = it.data(0, Qt.ItemDataRole.UserRole + 3)
+        if k is not None:
+            (self.open_arrays.discard if folded else self.open_arrays.add)((tab, k))
+            if it.treeWidget() in (self.run_l, self.hist_l):
+                self.fit_local()
+            self.place_hover()
+
+    def update_columns(self, t, tab):
+        t.setHeaderHidden(False)
+
+    @staticmethod
+    def set_group_text(gi):
+        head = gi.data(0, Qt.ItemDataRole.UserRole + 2) or ""
+        txt = ("▾  " if gi.isExpanded() else "▸  ") + head
+        if gi.text(0) != txt:
+            gi.setText(0, txt)
+
+    def fill(self, t, tabname, groups, flat=None):
+        """groups = [(group, header, rows)], row = (key, columns, payload, color[, children]).  Without clusters,
+        no groups.  Updated in place: only the rows that change are removed/added (the list is not rebuilt and does
+        not jump).  It is only rebuilt when the groups change (a cluster is added/removed)."""
+        KEY = Qt.ItemDataRole.UserRole + 3
+        if flat is None:
+            flat = len(groups) == 1 and groups[0][0] == "Local"
+        layout = (flat, [g for g, _, _ in groups])
+        cur = t.currentItem(); cur_key = cur.data(0, KEY) if cur else None
+        t.blockSignals(True)
+        if layout != t._layout:
+            t.clear(); t._items, t._groups, t._hover = {}, {}, None
+            t.setRootIsDecorated(False)     # no Qt arrows on groups: click the header (▸/▾ in the text)
+            if not flat:
+                for g, head, _ in groups:
+                    gi = QTreeWidgetItem(t, [head]); gi.setData(0, Qt.ItemDataRole.UserRole + 1, g)
+                    gi.setToolTip(0, "Click to expand or collapse")
+                    f = gi.font(0); f.setBold(True); gi.setFont(0, f)
+                    gi.setFirstColumnSpanned(True)
+                    gi.setChildIndicatorPolicy(QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator)
+                    gi.setExpanded((tabname, g) in self.open_groups)
+                    t._groups[g] = gi
+            t._layout = layout
+        for g, head, rows in groups:
+            self._sync(t, tabname, t.invisibleRootItem() if flat else t._groups[g], rows)
+        if cur_key is not None and cur_key in t._items and t.currentItem() is not t._items[cur_key]:
+            t.setCurrentItem(t._items[cur_key])
+        t.blockSignals(False)
+        for g, head, rows in groups:
+            if g in t._groups:
+                t._groups[g].setData(0, Qt.ItemDataRole.UserRole + 2, head)
+                self.set_group_text(t._groups[g])
+            self._update(t, rows)
+        self.update_columns(t, tabname)
+
+    def _forget(self, t, it):
+        t._items.pop(it.data(0, Qt.ItemDataRole.UserRole + 3), None)
+        if t._hover is it:
+            t._hover = None
+        for i in range(it.childCount()):
+            self._forget(t, it.child(i))
+
+    def _sync(self, t, tab, parent, rows):
+        KEY = Qt.ItemDataRole.UserRole + 3
+        want = {r[0] for r in rows}
+        for i in range(parent.childCount() - 1, -1, -1):        # remove rows that are gone
+            ch = parent.child(i)
+            if ch.data(0, KEY) not in want:
+                self._forget(t, ch); parent.takeChild(i)
+        for i, r in enumerate(rows):                              # insert new rows in place
+            key, cols = r[0], r[1]
+            ch = parent.child(i) if i < parent.childCount() else None
+            if ch is not None and ch.data(0, KEY) == key:
+                it = ch
+            else:
+                it = t._items.get(key)
+                if it is not None:                                # it was somewhere else: move it
+                    par = it.parent() or t.invisibleRootItem()
+                    par.takeChild(par.indexOfChild(it))
+                else:
+                    it = QTreeWidgetItem(cols); it.setData(0, KEY, key); t._items[key] = it
+                parent.insertChild(i, it)
+            kids = r[4] if len(r) > 4 else None
+            self._sync(t, tab, it, kids or [])
+            if kids:
+                it.setExpanded((tab, key) in self.open_arrays)
+
+    def _update(self, t, rows):
+        for r in rows:
+            key, cols, payload, color = r[:4]
+            it = t._items[key]
+            for c, v in enumerate(cols):
+                if c in t._xcols:
+                    continue
+                if it.text(c) != v:
+                    it.setText(c, v)
+                it.setData(c, Qt.ItemDataRole.ForegroundRole, color if (color and c == t._color_col) else None)
+            it.setData(0, Qt.ItemDataRole.UserRole, payload)
+            if payload and (payload.get("tip") or payload.get("cmd")):
+                tip = payload.get("tip") or payload["cmd"]
+                for c in range(len(cols)):
+                    if c not in t._xcols:
+                        it.setToolTip(c, tip)
+            if len(r) > 4 and r[4]:
+                self._update(t, r[4])
+
+    def clear_selection(self):
+        self.sel = None; self.out.clear(); self.title.setText(NO_SEL)
+        self.set_stream_buttons(None)
+
+    # ── ✓ (remove from the history) and 🗑 (remove and delete its logs) on the row under the mouse ──
+    def hover_target(self, t, it):
+        """-> ("row", key, payload) for a job / array, ("group", name) for a Local / cluster header, or None."""
+        if it is None:
+            return None
+        p = it.data(0, Qt.ItemDataRole.UserRole)
+        if p:
+            return ("row", it.data(0, Qt.ItemDataRole.UserRole + 3))
+        g = it.data(0, Qt.ItemDataRole.UserRole + 1)
+        return ("group", g) if g else None
+
+    def hover_item(self, t, it):
+        tgt = self.hover_target(t, it)
+        if tgt is None:
+            self.unhover(); return
+        self._hover = (t, tgt)
+        if self.hover_box is not None and self.hover_box.parent() is not t.viewport():
+            self.hover_box.hide()
+        self.hover_box = getattr(t, "_hover_box", None)
+        if self.hover_box is None:
+            box = QWidget(t.viewport()); t._hover_box = box; lay = QHBoxLayout(box); lay.setContentsMargins(0, 0, 4, 0); lay.setSpacing(2)
+            box.btns = []
+            for txt, color, delete in (("✓", "#2e9e48", False), ("🗑", "#d04040", True)):
+                b = QToolButton(box); b.setText(txt); b.setAutoRaise(True)
+                b.setStyleSheet(f"QToolButton {{ color: {color}; font-weight: bold; padding: 0 4px; }}")
+                b.setCursor(Qt.CursorShape.PointingHandCursor)
+                b.clicked.connect(lambda _, d=delete: self.hover_action(d))
+                lay.addWidget(b); box.btns.append(b)
+            self.hover_box = box
+        group = tgt[0] == "group"
+        what = (f"all the jobs of {tgt[1]}" if group else "this job")
+        self.hover_box.btns[0].setToolTip(f"Remove {what} from the history (logs are kept)")
+        self.hover_box.btns[1].setToolTip(f"Remove {what} from the history and delete {'their logs' if group else 'its log'} "
+                                          f"(temporary local logs, or the .out/.err on the cluster; logs saved with -l "
+                                          f"are never deleted)")
+        self.place_hover()
+
+    def hover_item_of(self, t, tgt):
+        return t._items.get(tgt[1]) if tgt[0] == "row" else t._groups.get(tgt[1])
+
+    def place_hover(self):
+        """Put the ✓ / 🗑 buttons at the right end of the hovered row (it may have moved after a refresh)."""
+        if not self._hover or self.hover_box is None:
+            return
+        t, tgt = self._hover
+        it = self.hover_item_of(t, tgt)
+        r = t.visualItemRect(it) if it is not None else None
+        if r is None or not r.isValid() or r.height() <= 0:
+            self.unhover(); return
+        box = self.hover_box
+        h = r.height(); [b.setFixedHeight(h) for b in box.btns]
+        box.adjustSize()
+        box.setGeometry(t.viewport().width() - box.width(), r.top(), box.width(), h)
+        box.show(); box.raise_()
+
+    def unhover(self):
+        self._hover = None
+        if self.hover_box is not None:
+            self.hover_box.hide()
+
+    def eventFilter(self, obj, ev):
+        for t in (self.hist_l, self.hist_c):
+            if obj is t.viewport():
+                if ev.type() == ev.Type.Leave:
+                    if self.hover_box is None or not self.hover_box.underMouse():
+                        self.unhover()
+                elif ev.type() == ev.Type.MouseMove:
+                    it = t.itemAt(ev.position().toPoint())
+                    tgt = self.hover_target(t, it)
+                    if tgt is None:
+                        self.unhover()
+                    elif not self._hover or self._hover != (t, tgt):
+                        self.hover_item(t, it)
+                elif ev.type() == ev.Type.Resize:
+                    self.place_hover()
+        return False
+
+    def hover_action(self, delete):
+        if not self._hover:
+            return
+        t, tgt = self._hover
+        it = self.hover_item_of(t, tgt)
+        p = it.data(0, Qt.ItemDataRole.UserRole) if it is not None else None
+        self.unhover()
+        # Act once Qt has finished handling the click: refresh() rebuilds parts of the tree (crash otherwise).
+        if tgt[0] == "group":
+            QTimer.singleShot(0, lambda: self.clear_history(delete, only=tgt[1]))
+        elif p:
+            QTimer.singleShot(0, lambda: self.remove_from_history(p, delete))
+
+    def delete_remote_logs(self, c, ids):
+        """Delete those jobs' .out/.err on the cluster (in the background) and notify the result."""
+        s = self.cstate.get(c["name"])
+        ids = list(dict.fromkeys(ids))
+        if not ids:
+            return
+
+        def run():
+            paths, skipped, unknown = [], 0, 0
+            for k in range(0, len(ids), 100):
+                chunk = ids[k:k + 100]
+                try:
+                    info = resolve_logs(c["host"], c.get("pre", ""), chunk)
+                except OSError:
+                    info = {}
+                for jid in chunk:
+                    pp = info.get(jid) or (s.log_paths.get(jid) if s else None)
+                    if not pp:
+                        unknown += 1; continue
+                    for path in dict.fromkeys([pp["out"], pp["err"]]):
+                        if own_log(path, jid):
+                            paths.append(path)
+                        else:
+                            skipped += 1
+            n = 0
+            for k in range(0, len(paths), 200):
+                chunk = paths[k:k + 200]
+                q = " ".join(shlex.quote(x) for x in chunk)
+                ok, out, err = ssh_run(c["host"], f"for f in {q}; do [ -f \"$f\" ] && rm -f -- \"$f\" && echo @@DEL; done",
+                                       timeout=120, pre=c.get("pre", ""))
+                n += out.count("@@DEL") if ok else 0
+            body = f"{n} .out/.err file(s) deleted"
+            if skipped:
+                body += f"; {skipped} kept because their name does not contain the job number (they might be shared)"
+            if unknown:
+                body += f"; for {unknown} job(s) Slurm no longer knows where the logs were"
+            notify(f"{c['name']}: logs deleted", body)
+            if s:
+                for jid in ids:
+                    s.log_paths.pop(jid, None)
+                    s.logs.pop((jid, "out"), None); s.logs.pop((jid, "err"), None)
+        threading.Thread(target=run, daemon=True).start()
+
+    def remove_from_history(self, p, delete=False):
+        """✓: only out of the list.  🗑: also delete its logs (temporary local log / .out and .err on the cluster)."""
+        if p["kind"] == "local":
+            remove_history_entry(p, delete_log=delete)
+        else:
+            c, s = self.cluster(p["cluster"]), self.cstate.get(p["cluster"])
+            if c:
+                known = {r["id"] for r in s.hist} if s and s.ok else None
+                ids = p.get("ids") or [p["id"]]
+                c["hidden"] = [i for i in c.get("hidden", []) if known is None or i in known] + ids
+                save_clusters(self.clusters)
+                if delete:
+                    self.delete_remote_logs(c, ids)
+        if delete:
+            self.close_log_tabs(lambda i: i.get("key") == p.get("key") or
+                                (p.get("ids") and i.get("cluster") == p.get("cluster") and i.get("id") in p["ids"]))
+        self.refresh()
+
+    def cluster_head(self, c, n):
+        s = self.cstate.get(c["name"])
+        if not s or s.first:
+            return f"{c['name']}   ·   connecting…"
+        if not s.ok:
+            return f"{c['name']}   ·   not connected (right-click > Connect…)   ·   {s.err[:80]}"
+        return f"{c['name']}   ·   {n}   ·   {time.strftime('%H:%M:%S', time.localtime(s.t))}"
+
+    def hist_match(self, *texts, error=False):
+        """History filter: search box text and 'All / Errors only / OK only'."""
+        f = self.hfilter.currentIndex()
+        if (f == 1 and not error) or (f == 2 and error):
+            return False
+        q = self.hsearch.text().strip().lower()
+        return not q or any(q in str(x).lower() for x in texts)
+
+    def local_rows(self, jobs):
+        """Local rows of "Running" with the RAM, CPU and GPU of each job (summed over its child processes)."""
+        table = proc_table(); kids = {}
+        for pid, (pp, _, _) in table.items():
+            kids.setdefault(pp, []).append(pid)
+        gstat, gpid = gpu_info()
+        now = time.time(); rows, seen = [], set()
+        same = {}
+        for j in jobs:
+            same.setdefault((j["cmd"], j["cwd"]), []).append(j["label"])
+        for j in jobs:
+            key = ("local", j["label"], j["pid"]); seen.add(key)
+            pids = tree_of(j["pid"], table, kids)
+            rss = sum(table[p][1] for p in pids); ticks = sum(table[p][2] for p in pids)
+            gpu = sum(gpid.get(p, 0) for p in pids)
+            prev = self.prev_ticks.get(key)
+            cpu = f"{max(0, ticks - prev[0]) / CLK / max(now - prev[1], 1e-3):.1f} cores" if prev else "…"
+            self.prev_ticks[key] = (ticks, now)
+            dups = [x for x in same[(j["cmd"], j["cwd"])] if x != j["label"]]
+            tip = j["cmd"] + (f"\n\n⚠ DUPLICATE: the same command, in the same folder, is also running as: "
+                              f"{', '.join(dups)}" if dups else "")
+            rows.append((key, [f"● {j['label']}", fmt_dt(now - j["start"]), fmt_bytes(rss), cpu,
+                               fmt_bytes(gpu) if gpu else "—", "⚠ duplicate" if dups else "running"],
+                         dict(j, kind="local", key=key, tip=tip), ORANGE if dups else None))
+        for k in [k for k in self.prev_ticks if k not in seen]:
+            del self.prev_ticks[k]
+        return rows, gstat
+
+    def cluster_run_rows(self, c, s):
+        """Rows of one cluster in "Running"; the tasks of a job array are grouped in one expandable row."""
+        entries = [r for r in s.running if S["show_pending"] or r["state"] != "PENDING"]
+        by_arr = {}
+        for r in entries:
+            if array_of(r["id"]):
+                by_arr.setdefault(array_of(r["id"]), []).append(r)
+
+        def task_row(r):
+            key = (c["name"], r["id"])
+            st = SLURM_CODE.get(r["state"], r["state"])
+            if r["state"] == "PENDING" and r["reason"].strip("()") not in ("", "None"):
+                st += f" ({r['reason'].strip('()')})"
+            est = time.strftime("%d-%m %H:%M", time.localtime(s.starts[r["id"]])) if r["id"] in s.starts else ""
+            return (key, [f"● {r['name']}  [{r['id']}]", r["used"] if r["state"] != "PENDING" else "", "", "",
+                          r.get("gpu", ""), st, est,
+                          r.get("part", "")],
+                    dict(kind="cluster", cluster=c["name"], id=r["id"], label=r["name"], running=True, key=key,
+                         cmd=f"{r['nodes']} node(s), time limit {r['limit']}" + (f", {r['reason']}" if r["state"] == "RUNNING" else "")),
+                    GREY if r["state"] == "PENDING" else None)
+        rows, done_groups = [], set()
+        for r in entries:
+            arr = array_of(r["id"])
+            if not arr or len(by_arr[arr]) < 2:
+                rows.append(task_row(r)); continue
+            if arr in done_groups:
+                continue
+            done_groups.add(arr)
+            tasks = by_arr[arr]
+            n_run = sum(1 for t in tasks if t["state"] != "PENDING")
+            n_pd = sum(array_task_count(t["id"]) for t in tasks if t["state"] == "PENDING")
+            n_done = sum(1 for h in s.hist if array_of(h["id"]) == arr)
+            total = n_run + n_pd + n_done
+            used = max((t["used"] for t in tasks if t["state"] != "PENDING"), key=lambda u: slurm_secs(u) or 0, default="")
+            key = (c["name"], "array", arr)
+            ests = [s.starts[t["id"]] for t in tasks if t["id"] in s.starts]
+            est = time.strftime("%d-%m %H:%M", time.localtime(min(ests))) if ests else ""
+            rows.append((key, [f"● {tasks[0]['name']}  [{arr}]  · array", used, "", "", "",
+                               f"{n_done}/{total} done · {n_run} R · {n_pd} PD", est,
+                               ", ".join(dict.fromkeys(t.get("part", "") for t in tasks if t.get("part")))],
+                         dict(kind="array", cluster=c["name"], id=arr, label=tasks[0]["name"], running=True, key=key,
+                              ids=[t["id"] for t in tasks],
+                              cmd=f"Array {arr}: {total} tasks ({n_done} finished, {n_run} running, {n_pd} queued)"),
+                         GREY if not n_run else None, [task_row(t) for t in tasks]))
+        return rows
+
+    def cluster_hist_rows(self, c, s):
+        """Rows of one cluster in "History" (filtered); job arrays are grouped in one expandable row."""
+        items = []
+        for r in sorted(s.hist, key=lambda r: r["end"], reverse=True):
+            if r["end"] <= c.get("cleared", 0) or r["id"] in c.get("hidden", ()):
+                continue
+            txt = slurm_end_text(r["state"], r["exit"])
+            if not self.hist_match(r["name"], r["id"], txt, r["state"], error=txt != "ok"):
+                continue
+            items.append((r, txt))
+
+        def task_row(r, txt):
+            key = (c["name"], r["id"])
+            return (key, [f"{r['name']}  [{r['id']}]", r.get("part", ""), time.strftime("%d-%m %H:%M", time.localtime(r["end"])),
+                          fmt_dt(r["elapsed"]) if r["elapsed"] is not None else "?", txt],
+                    dict(kind="cluster", cluster=c["name"], id=r["id"], label=r["name"], running=False, key=key,
+                         cmd=f"Slurm state: {r['state']}, ExitCode {r['exit']}"),
+                    RED if txt != "ok" else None)
+        by_arr = {}
+        for r, txt in items:
+            if array_of(r["id"]):
+                by_arr.setdefault(array_of(r["id"]), []).append((r, txt))
+        rows, done_groups = [], set()
+        for r, txt in items:
+            arr = array_of(r["id"])
+            if not arr or len(by_arr[arr]) < 2:
+                rows.append(task_row(r, txt)); continue
+            if arr in done_groups:
+                continue
+            done_groups.add(arr)
+            tasks = sorted(by_arr[arr], key=lambda x: int(x[0]["id"].split("_")[1]) if x[0]["id"].split("_")[1].isdigit() else 0)
+            n_err = sum(1 for _, t in tasks if t != "ok")
+            end = max(x["end"] for x, _ in tasks)
+            dur = max((x["elapsed"] or 0) for x, _ in tasks)
+            key = (c["name"], "array", arr)
+            rows.append((key, [f"{tasks[0][0]['name']}  [{arr}]  · array of {len(tasks)}",
+                               ", ".join(dict.fromkeys(x.get("part", "") for x, _ in tasks if x.get("part"))),
+                               time.strftime("%d-%m %H:%M", time.localtime(end)), fmt_dt(dur),
+                               "ok" if not n_err else f"{n_err} failed"],
+                         dict(kind="array", cluster=c["name"], id=arr, label=tasks[0][0]["name"], running=False, key=key,
+                              ids=[x["id"] for x, _ in tasks],
+                              cmd=f"Array {arr}: {len(tasks)} tasks, {n_err} failed (duration = that of the longest task)"),
+                         RED if n_err else None, [task_row(x, t) for x, t in tasks]))
+        return rows
+
+    def refresh(self):
+        for c in self.clusters:
+            self.poll_cluster(c)
+        jobs = running_jobs()
+        self.check_finished(jobs)
+        n_cl = sum(len(self.cstate[c["name"]].running) for c in self.clusters if c["name"] in self.cstate)
+        self.update_tray(len(jobs), sum(1 for c in self.clusters if c["name"] in self.cstate
+                                        for r in self.cstate[c["name"]].running if r["state"] != "PENDING"))
+
+        # running
+        rows, gstat = self.local_rows(jobs)
+        mem = meminfo()
+        self.status.setText(f"{time.strftime('%H:%M:%S')}    "
+                            + (f"RAM {mem[0] / 2 ** 30:.1f}/{mem[1] / 2 ** 30:.1f} GB    " if mem else "")
+                            + f"{gstat}    |    {len(jobs)} running locally"
+                            + (f",  {n_cl} on clusters" if self.clusters else ""))
+        if not rows and not self.clusters:
+            rows.append((("none",), ["Nothing running.", "", "", "", "", "", "", ""], None, None))
+        self.fill(self.run_l, "run", [("Local", f"Local   ·   {len(jobs)} running", rows)], flat=not self.clusters)
+        groups = []
+        for c in self.clusters:
+            s = self.cstate[c["name"]]
+            crow = self.cluster_run_rows(c, s)
+            n_run = sum(1 for r in s.running if r["state"] != "PENDING")
+            n_pd = sum(array_task_count(r["id"]) for r in s.running if r["state"] == "PENDING")
+            groups.append((c["name"], self.cluster_head(c, f"{n_run} running, {n_pd} queued"), crow))
+        self.run_c.setVisible(bool(self.clusters))
+        if self.clusters:
+            self.fill(self.run_c, "run", groups, flat=False)
+        self.fit_local()
+
+        # history
+        rows = []
+        for r in history():
+            ex = r.get("exit", "?")
+            if not self.hist_match(r.get("label", ""), r.get("cmd", ""), local_exit_text(ex), error=ex != 0):
+                continue
+            key = ("local", r.get("label"), r.get("end"))
+            rows.append((key, [r.get("label", "?"), "", time.strftime("%d-%m %H:%M", time.localtime(r.get("end", 0))),
+                               fmt_dt(r.get("end", 0) - r.get("start", 0)), local_exit_text(ex)],
+                         dict(r, kind="local", key=key), RED if ex != 0 else None))
+        if not rows and not self.clusters:
+            rows.append((("none",), ["No finished jobs.", "", "", "", ""], None, None))
+        self.update_cluster_info()
+        self.fill(self.hist_l, "hist", [("Local", f"Local   ·   {len(rows)}", rows)], flat=not self.clusters)
+        groups = []
+        for c in self.clusters:
+            s = self.cstate[c["name"]]
+            crow = self.cluster_hist_rows(c, s)
+            n = sum(len(r[4]) if len(r) > 4 else 1 for r in crow)
+            groups.append((c["name"], self.cluster_head(c, f"{n} (last {cset(c, 'hist_days')} days)"), crow))
+        self.hist_c.setVisible(bool(self.clusters))
+        if self.clusters:
+            self.fill(self.hist_c, "hist", groups, flat=False)
+        self.fit_local()
+        self.place_hover()
+        self.refresh_tabs()
+        self.show_log()
+
+    # ── cluster status panel ──
+    INFO_COLS = ["Partition", "Time limit", "Idle nodes", "Down", "Free CPUs", "Free GPUs", "Free mem",
+                 "All R/PD", "Mine R/PD"]
+
+    QUEUE_COLS = ["Job ID", "User", "Partition", "Name", "State", "Time", "Limit", "Nodes", "GPUs", "Nodes / reason"]
+
+    def cinfo_index(self, name):
+        return next((i for i in range(self.cinfo.count()) if self.cinfo.widget(i)._cluster == name), -1)
+
+    def show_cluster_info(self, c):
+        i = self.cinfo_index(c["name"])
+        if i < 0:
+            w = QWidget(); w._cluster, w._shown, w._sorted = c["name"], None, False
+            lay = QVBoxLayout(w); lay.setContentsMargins(6, 6, 6, 6)
+            w.summary = QLabel("Reading the cluster status…"); w.summary.setWordWrap(True)
+            w.summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            w.table = QTreeWidget(); w.table.setHeaderLabels(self.INFO_COLS); w.table.setRootIsDecorated(False)
+            w.table.setUniformRowHeights(True); w.table.setFont(self.run_c.font())
+            w.table.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+            w.table.setSortingEnabled(False)
+            tips = ["", "Maximum run time of a job", "Nodes with nothing running / all nodes",
+                    "Nodes down, drained, in maintenance… (their CPUs and GPUs are not counted as free)",
+                    "Idle CPU cores on usable nodes / all cores", "GPUs not allocated on usable nodes / all GPUs",
+                    "Memory not allocated on usable nodes",
+                    "Jobs of all users (— when the cluster only lets you see your own jobs)", "Your jobs"]
+            for k, tip in enumerate(tips):
+                w.table.headerItem().setToolTip(k, tip)
+            w.queue = QTreeWidget(); w.queue.setHeaderLabels(self.QUEUE_COLS); w.queue.setRootIsDecorated(False)
+            w.queue.setUniformRowHeights(True); w.queue.setFont(self.run_c.font())
+            w.queue.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+            w.queue.header().setSortIndicatorShown(True); w.queue.header().setSectionsClickable(True)
+            w.queue.header().sortIndicatorChanged.connect(lambda *_, w=w: setattr(w, "_sorted", True))
+            w.inner = QTabWidget(); w.inner.addTab(w.table, "Partitions"); w.inner.addTab(w.queue, "Queue")
+            lay.addWidget(w.summary); lay.addWidget(w.inner, 1)
+            i = self.cinfo.addTab(w, c["name"])
+            if not self.cinfo.isVisible():
+                self.cinfo.show()
+                h = self.run_split.height(); self.run_split.setSizes([int(h * 0.55), int(h * 0.45)])
+        self.cinfo.setCurrentIndex(i)
+        self.tabs.setCurrentIndex(0)
+        self.fetch_cluster_info(c, force=True)
+        self.render_cluster_info(self.cinfo.widget(i))
+
+    def close_cluster_info(self, i):
+        w = self.cinfo.widget(i)
+        self.cinfo.removeTab(i)
+        if w is not None:
+            w.deleteLater()
+        if not self.cinfo.count():
+            self.cinfo.hide()           # back to the plain "Running" view
+
+    def fetch_cluster_info(self, c, force=False):
+        s = self.cstate.setdefault(c["name"], ClusterState())
+        if s.info_busy or (not force and time.time() - s.info_t < c.get("info_every", CLUSTER_INFO_EVERY_DEFAULT)):
+            return
+        s.info_busy = True
+
+        def run():
+            try:
+                ok, out, err = ssh_run(c["host"], info_script() + "true", timeout=120, pre=c.get("pre", ""))
+                if ok:
+                    s.info, s.info_err = parse_info(out), ""
+                else:
+                    s.info_err = err or "no connection"
+            except Exception as e:
+                s.info_err = str(e)
+            s.info_t, s.info_busy = time.time(), False
+        threading.Thread(target=run, daemon=True).start()
+
+    def update_cluster_info(self):
+        """Called by refresh(): re-query the open panels when due (only while the window is shown; when it is shown
+        again they are brought up to date at once), close those of removed clusters, redraw."""
+        for i in reversed(range(self.cinfo.count())):
+            w = self.cinfo.widget(i); c = self.cluster(w._cluster)
+            if not c:
+                self.close_cluster_info(i); continue
+            if self.isVisible() and not self.isMinimized():   # paused while the window is hidden / minimized
+                self.fetch_cluster_info(c)
+            self.render_cluster_info(w)
+
+    @staticmethod
+    def fmt_gpus(free, tot):
+        if not tot:
+            return "—"
+        f, t = sum(free.values()), sum(tot.values())
+        types = [k for k in tot if k]
+        if not types:
+            return f"{f} / {t}"
+        if len(types) == 1:
+            return f"{f} / {t}  {types[0]}"
+        return f"{f} / {t}  (" + ", ".join(f"{k} {free.get(k, 0)}/{tot[k]}" for k in tot) + ")"
+
+    def render_cluster_info(self, w):
+        name = w._cluster; c = self.cluster(name); s = self.cstate.get(name)
+        if not c or not s:
+            return
+        stamp = (s.info_t, s.info_err, s.info is None)
+        if w._shown == stamp:
+            return
+        w._shown = stamp
+        every = c.get("info_every", CLUSTER_INFO_EVERY_DEFAULT)
+        when = time.strftime("%H:%M:%S", time.localtime(s.info_t)) if s.info_t else ""
+        if s.info is None:
+            w.summary.setText(f"<b>{name}</b>  ·  " + (f"<span style='color:#d04040'>could not read the status: "
+                                                        f"{s.info_err[:200]}</span>" if s.info_err else "reading…"))
+            return
+        i, T = s.info, s.info["total"]
+        dash = "—"
+
+        def jobs(d, mine=False):
+            r, p = (d["my_run"], d["my_pend"]) if mine else (d["run"], d["pend"])
+            return dash if r is None else f"{r} / {p}"
+        mem = lambda mb: f"{mb / 1024 ** 2:.1f} TB" if mb >= 1024 ** 2 else f"{mb / 1024:.0f} GB"
+        lines = [f"<b>{name}</b>  ·  updated {when} (every {every} s)"
+                 + (f"  ·  <span style='color:#d04040'>last update failed: {s.info_err[:120]}</span>" if s.info_err else "")]
+        if i["have_nodes"]:
+            lines.append(f"Nodes: <b>{T['nodes']}</b> ({T['idle']} idle, {T['down']} unavailable)  ·  "
+                         f"CPUs free: <b>{T['cpu_free']}</b> / {T['cpu_tot']}  ·  "
+                         f"GPUs free: <b>{self.fmt_gpus(T['gpu_free'], T['gpu_tot'])}</b>  ·  "
+                         f"free memory: {mem(T['mem_free'])}")
+        else:
+            lines.append("Nodes: — (this cluster does not show them)")
+        lines.append("Jobs of everyone: " + (f"<b>{T['run']}</b> running, <b>{T['pend']}</b> queued" if T["run"] is not None
+                                             else "— (this cluster only lets you see your own jobs)"))
+        mine = f"Your jobs: <b>{T['my_run']}</b> running, <b>{T['my_pend']}</b> queued"
+        if i["share"]:
+            mine += ("  ·  fairshare: " + ", ".join(f"{a} {float(v):.3f}" if v.replace('.', '', 1).isdigit()
+                                                     else f"{a} {v}" for a, v in i["share"])
+                     + "  <small>(0–1; the higher, the sooner your jobs start)</small>")
+        lines.append(mine)
+        w.summary.setText("<br>".join(lines))
+        vbar = w.table.verticalScrollBar().value()
+        w.table.clear()
+        for d in i["parts"]:
+            it = QTreeWidgetItem([d["name"] + ("  (default)" if d["name"] == i["default"] else ""),
+                                  d.get("limit") or dash,
+                                  f"{d['idle']} / {d['nodes']}" if d["nodes"] else dash,
+                                  str(d["down"]) if d["nodes"] else dash,
+                                  f"{d['cpu_free']} / {d['cpu_tot']}" if d["nodes"] else dash,
+                                  self.fmt_gpus(d["gpu_free"], d["gpu_tot"]),
+                                  mem(d["mem_free"]) if d["nodes"] else dash,
+                                  jobs(d), jobs(d, True)])
+            if d.get("avail") and d["avail"] != "up":
+                for k in range(len(self.INFO_COLS)):
+                    it.setForeground(k, GREY)
+                it.setToolTip(0, f"Partition {d['avail']}")
+            w.table.addTopLevelItem(it)
+        w.table.verticalScrollBar().setValue(vbar)
+        # queue of everyone (only when the cluster lets us see other users' jobs)
+        qi = w.inner.indexOf(w.queue)
+        w.inner.setTabVisible(qi, not i["private"])
+        if i["private"]:
+            return
+        n_r = sum(1 for q in i["queue"] if q["state"] == "RUNNING")
+        n_pd = sum(1 for q in i["queue"] if q["state"] == "PENDING")
+        w.inner.setTabText(qi, f"Queue of everyone ({n_r} R, {n_pd} PD)")
+        vbar = w.queue.verticalScrollBar().value()
+        col, order = w.queue.header().sortIndicatorSection(), w.queue.header().sortIndicatorOrder()
+        w.queue.setSortingEnabled(False); w.queue.clear()
+        bold = w.queue.font(); bold.setBold(True)
+        for q in i["queue"][:5000]:
+            g = q.get("gpu", "")
+            if g.startswith(q["reason"] + " · ") and ", " not in g:     # the node is already in the last column
+                g = g[len(q["reason"]) + 3:]
+            it = QTreeWidgetItem([q["id"], q["user"], q["part"], q["name"], SLURM_CODE.get(q["state"], q["state"]),
+                                  q["used"] if q["state"] != "PENDING" else "", q["limit"], q["nodes"],
+                                  g, q["reason"].strip("()")])
+            if q["mine"]:
+                for k in range(len(self.QUEUE_COLS)):
+                    it.setFont(k, bold)
+            if q["state"] == "PENDING":
+                for k in range(len(self.QUEUE_COLS)):
+                    it.setForeground(k, GREY)
+            w.queue.addTopLevelItem(it)
+        if w._sorted:
+            w.queue.setSortingEnabled(True); w.queue.sortByColumn(col, order)
+        else:       # first time: keep the order of the list (running first), but allow sorting by clicking headers
+            h = w.queue.header(); h.blockSignals(True)
+            h.setSortIndicator(-1, Qt.SortOrder.AscendingOrder); w.queue.setSortingEnabled(True)
+            h.blockSignals(False)
+        w.queue.setColumnHidden(self.QUEUE_COLS.index("GPUs"), not S["show_gpus"])
+        w.queue.verticalScrollBar().setValue(vbar)
+
+    # ── settings ──
+    def apply_settings(self):
+        self.timer.setInterval(S["local_every"] * 1000)
+        self.run_c.setColumnHidden(4, not S["show_gpus"])        # clusters: GPU = node and GPU number(s)
+        self.run_c.headerItem().setToolTip(4, "Node and GPU number(s) the job runs on (for queued jobs: how many "
+                                              "GPUs it asks for)")
+        self.setup_tray()
+        f = self.out.font(); f.setPointSize(S["log_font"]); self.out.setFont(f)
+        self.out.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth if S["wrap_log"]
+                                 else QPlainTextEdit.LineWrapMode.NoWrap)
+
+    def open_settings(self):
+        d = SettingsDialog(self, self.clusters)
+        if d.exec() != QDialog.DialogCode.Accepted:
+            return
+        old = dict(S); S.update(d.values()); save_settings(); self.apply_settings()
+        vals, changed, repoll = d.cluster_values(), False, set()
+        for c in self.clusters:
+            for k, v in vals.get(c["name"], {}).items():
+                if c.get(k) != v:
+                    if k == "hist_days" and cset(c, k) != v:
+                        repoll.add(c["name"])
+                    c[k] = v; changed = True
+        if changed:
+            save_clusters(self.clusters)
+        if S["tail_kb"] != old["tail_kb"]:
+            for st in self.cstate.values():
+                st.logs.clear()
+        for c in self.clusters:
+            if c["name"] in repoll:
+                self.poll_cluster(c, force=True)
+        self.refresh()
+        if self.sel:
+            self.select(self.sel)
+
+    # ── notifications ──
+    def check_finished(self, jobs):
+        now = {(j["label"], j["pid"]): j for j in jobs}
+        if self.prev_local is not None and S["notify_local"]:
+            gone = [j for k, j in self.prev_local.items() if k not in now]
+            if gone:
+                hist = history()
+                for j in gone:
+                    r = next((r for r in hist if r.get("label") == j["label"] and r.get("start") == j["start"]), None)
+                    ex = r.get("exit") if r else None
+                    if ex == 0 and not S["notify_ok"]:
+                        continue
+                    txt = local_exit_text(ex) if ex is not None else "finished"
+                    notify(f"{j['label']}: {txt}", f"Local · {fmt_dt(time.time() - j['start'])}",
+                           error=ex not in (0, None))
+        self.prev_local = now
+        for c in self.clusters:
+            s = self.cstate.get(c["name"])
+            if not s or not s.ok:
+                continue
+            prev = self.prev_cluster.get(c["name"])
+            if prev is not None and prev[0] == s.t:
+                continue          # no new query yet
+            ids = {r["id"]: r for r in s.running}
+            if prev is not None and S["notify_start"]:     # PD -> R (or an array task that just started)
+                started = [r for jid, r in ids.items() if r["state"] == "RUNNING"
+                           and (jid not in prev[1] or prev[1][jid]["state"] == "PENDING")]
+                if 0 < len(started) <= 3:
+                    for r in started:
+                        notify(f"{r['name']}: started", f"{c['name']} · job {r['id']}"
+                               + (f" · {r.get('part')}" if r.get("part") else ""))
+                elif started:
+                    names = ", ".join(dict.fromkeys(r["name"] for r in started))
+                    notify(f"{c['name']}: {len(started)} jobs started", names[:200])
+            waiting = prev[2] if prev else {}
+            if prev is not None:
+                for jid, r in prev[1].items():
+                    if jid not in ids and r["state"] != "PENDING":
+                        waiting[jid] = (r, 0)
+            hist = {r["id"]: r for r in s.hist}
+            for jid, (r, tries) in list(waiting.items()):
+                h = hist.get(jid)
+                if h or tries >= 3:
+                    del waiting[jid]
+                    txt = slurm_end_text(h["state"], h["exit"]) if h else "finished"
+                    if S["notify_cluster"] and (txt != "ok" or S["notify_ok"]):
+                        notify(f"{r['name']}: {txt}", f"{c['name']} · job {jid}", error=txt not in ("ok", "finished"))
+                else:
+                    waiting[jid] = (r, tries + 1)
+            self.prev_cluster[c["name"]] = (s.t, ids, waiting)
+
+    # ── right-click menus ──
+    def context_menu(self, t, pos):
+        it = t.itemAt(pos)
+        if not it:
+            return
+        g = it.data(0, Qt.ItemDataRole.UserRole + 1)
+        p = it.data(0, Qt.ItemDataRole.UserRole)
+        menu = QMenu(self); acts = {}
+        if g and g != "Local":
+            c = self.cluster(g)
+            acts[menu.addAction("Refresh now")] = lambda: self.poll_cluster(c, force=True)
+            if t is self.run_c:
+                acts[menu.addAction("Show cluster status")] = lambda: self.show_cluster_info(c)
+            st = self.cstate.get(c["name"])
+            if st and st.ok:
+                acts[menu.addAction("Disconnect")] = lambda: self.disconnect_cluster(c)
+            else:
+                acts[menu.addAction("Connect… (log in from a terminal)")] = lambda: self.connect(c)
+            menu.addSeparator()
+            acts[menu.addAction("Edit…")] = lambda: self.edit_cluster(c)
+            acts[menu.addAction("Remove cluster")] = lambda: self.remove_cluster(c)
+        elif p and t in (self.run_l, self.run_c) and p["kind"] == "local":
+            acts[menu.addAction("Terminate (SIGTERM)")] = lambda: self.stop(p, signal.SIGTERM, "Terminate")
+            acts[menu.addAction("Kill (SIGKILL)")] = lambda: self.stop(p, signal.SIGKILL, "Kill")
+        elif p and t in (self.run_l, self.run_c) and p["kind"] == "cluster":
+            acts[menu.addAction("Cancel (scancel)")] = lambda: self.scancel(p)
+        elif p and t in (self.run_l, self.run_c) and p["kind"] == "array":
+            acts[menu.addAction(f"Cancel the whole array {p['id']} (scancel)")] = lambda: self.scancel(p)
+        elif p and t in (self.hist_l, self.hist_c) and p["kind"] == "local":
+            acts[menu.addAction("Run again…")] = lambda: self.relaunch(p)
+        if not acts:
+            return
+        a = menu.exec(t.viewport().mapToGlobal(pos))
+        if a in acts:
+            acts[a]()
+
+    def stop(self, j, sig, verb):
+        if not alive(j["pid"]):
+            self.refresh(); return
+        if not ask(self, verb, f"{verb} «{j['label']}»?\n\n{j['cmd']}"):
+            return
+        try:
+            stop_job(j["pid"], sig)
+        except PermissionError:
+            tell(self, verb, "Not allowed to send a signal to that process (or it is not a job started with track).")
+        QTimer.singleShot(500, self.refresh)
+
+    def relaunch(self, r):
+        """Run a local job from the history again with `track`, in its folder, registering it in the same list."""
+        track = shutil.which("track") or os.path.expanduser("~/.local/bin/track")
+        if not os.path.exists(track):
+            tell(self, "Run again", "`track` not found (did you run install.sh?)."); return
+        argv, cmd, d = r.get("argv", ""), r.get("cmd", ""), r["_dir"]
+        cwd = r.get("cwd") or os.path.expanduser("~")
+        log = r.get("log", "")
+        temp = log.startswith(os.path.join(d, "logs") + os.sep)
+        busy = {j["label"] for j in running_jobs()}
+        base = label = r.get("label", "job"); k = 2
+        while label in busy:
+            label = f"{base}-{k}"; k += 1
+        box = QMessageBox(self); box.setWindowTitle("Run again"); box.setIcon(QMessageBox.Icon.Question)
+        text = f"Run «{base}» again?\n\nCommand (exactly as it will be run):\n{argv or cmd}\n\nFolder:  {cwd}"
+        if label != base:
+            text += f"\nLabel:  {label}  (one with the same name is already running)"
+        if not argv:
+            text += ("\n\nThis is an old job: the command is run again as it was saved (check it if it had arguments "
+                     "with spaces or quotes).")
+        if not temp and log:
+            text += f"\n\nIts log was permanent: {log}"
+        box.setText(text)
+        keep = box.addButton("Run, overwriting that log", QMessageBox.ButtonRole.AcceptRole) if (log and not temp) else None
+        go = box.addButton("Run with a new temporary log" if keep else "Run", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        b = box.clickedButton()
+        if b is not go and (keep is None or b is not keep):
+            return
+        opts = f"-l {shlex.quote(log)} " if (keep is not None and b is keep) else ""
+        line = f"exec {shlex.quote(track)} {opts}{shlex.quote(label)} {argv or cmd}"
+        subprocess.Popen(["bash", "-c", line], cwd=cwd if os.path.isdir(cwd) else None,
+                         env=dict(os.environ, TRACKTOR_DIR=d), start_new_session=True, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.tabs.setCurrentIndex(0)
+        QTimer.singleShot(800, self.refresh)
+
+    def scancel(self, p):
+        c = self.cluster(p["cluster"])
+        if not c or not ask(self, "Cancel", f"Cancel «{p['label']}» (job {p['id']}) on "
+                                         f"{c['name']}?"):
+            return
+        res = {}
+
+        def run():
+            res["r"] = ssh_run(c["host"], f"scancel {shlex.quote(p['id'])} 2>&1", timeout=30, pre=c.get("pre", ""))
+        th = threading.Thread(target=run, daemon=True); th.start()
+
+        def done():
+            if th.is_alive():
+                QTimer.singleShot(300, done); return
+            ok, out, err = res["r"]
+            if not ok or out.strip():
+                tell(self, "Cancel", f"scancel: {(out.strip() or err)}")
+            self.poll_cluster(c, force=True)
+        QTimer.singleShot(300, done)
+
+    # ── system tray ──
+    def setup_tray(self):
+        global TRAY
+        want = S["tray"] and QSystemTrayIcon.isSystemTrayAvailable()
+        if want and self.tray is None:
+            self.tray = QSystemTrayIcon(tray_icon(0), self)
+            m = QMenu(self)
+            m.addAction("Show window").triggered.connect(self.show_window)
+            m.addSeparator()
+            m.addAction("Quit").triggered.connect(self.quit_app)
+            self.tray.setContextMenu(m)
+            self.tray.activated.connect(lambda r: self.toggle_window() if r == QSystemTrayIcon.ActivationReason.Trigger else None)
+            self.tray.setToolTip(APP); self.tray.show(); self._tray_n = None
+        elif not want and self.tray is not None:
+            self.tray.hide(); self.tray.deleteLater(); self.tray = None
+        TRAY = self.tray
+
+    def update_tray(self, n_local, n_cluster):
+        """Number of running jobs (queued cluster jobs not counted) on the tray icon and on the taskbar icon."""
+        n = n_local + n_cluster
+        if n != getattr(self, "_taskbar_n", None):
+            taskbar_count(n); self._taskbar_n = n
+        if self.tray is None:
+            return
+        if n != self._tray_n:
+            self.tray.setIcon(tray_icon(n)); self._tray_n = n
+        self.tray.setToolTip(f"{APP}: {n_local} running locally" + (f", {n_cluster} on clusters" if self.clusters else ""))
+
+    def show_window(self):
+        self.showNormal(); self.raise_(); self.activateWindow()
+
+    def toggle_window(self):
+        if self.isVisible() and not self.isMinimized():
+            self.hide()
+        else:
+            self.show_window()
+
+    def quit_app(self):
+        self._quitting = True
+        self.close()
+
+    def disconnect_cluster(self, c):
+        disconnect(c)
+        st = self.cstate.get(c["name"])
+        if st:
+            st.ok, st.err = False, "connection closed"
+        self.refresh()
+
+    def connect(self, c):
+        if not connect_in_terminal(c):
+            tell(self, "Connect", "No terminal emulator found.  Open one and run:\n\n"
+                 + " ".join(shlex.quote(x) for x in [SSH, *ssh_opts("yes", f"{cset(c, 'persist_hours')}h"), c["host"], "true"]),
+                 QMessageBox.Icon.Information)
+            return
+        s = self.cstate.get(c["name"])
+        # retry a few times while the user logs in
+        for k in range(1, 13):
+            QTimer.singleShot(k * 5000, lambda: self.poll_cluster(c, force=not (s and s.ok)))
+
+    # ── add / edit / remove clusters ──
+    def add_cluster(self):
+        d = ClusterDialog(self, taken=[c["name"] for c in self.clusters])
+        if d.exec() != QDialog.DialogCode.Accepted:
+            return
+        c = d.value(); self.clusters.append(c); save_clusters(self.clusters)
+        self.cstate[c["name"]] = ClusterState()
+        self.refresh()
+
+    def edit_cluster(self, c):
+        d = ClusterDialog(self, existing=c, taken=[x["name"] for x in self.clusters if x is not c])
+        if d.exec() != QDialog.DialogCode.Accepted:
+            return
+        v = d.value()
+        self.cstate.pop(c["name"], None)
+        c.update(v); save_clusters(self.clusters)
+        self.cstate[c["name"]] = ClusterState()
+        self.refresh()
+
+    def remove_cluster(self, c):
+        if not ask(self, "Remove cluster", f"Remove «{c['name']}» from the window?\n(Nothing is changed "
+                                f"on the cluster or in your ~/.ssh/config.)"):
+            return
+        self.clusters.remove(c); save_clusters(self.clusters); self.cstate.pop(c["name"], None)
+        self.close_log_tabs(lambda i: i.get("cluster") == c["name"])
+        self.refresh()
+
+    # ── closing and history ──
+    def closeEvent(self, ev):
+        # With the tray: closing the window only hides it (still watching and notifying); "Quit" in its menu exits.
+        if self.tray is not None and not self._quitting:
+            self.hide(); ev.ignore()
+            if S["tray_notice"]:
+                self.tray.showMessage(f"{APP} keeps running in the background",
+                                      "Still watching and notifying from the system tray.  To quit completely: "
+                                      "right-click the icon > Quit.")
+            return
+        # When really quitting, with the option on: leave nothing behind (cut running queries and close the master
+        # connections).  Without it, the connections stay open until the configured idle time has passed.
+        if S["close_on_exit"]:
+            kill_active()
+            close_all_masters()
+        if self.tray is not None:
+            self.tray.hide()
+        super().closeEvent(ev)
+        QTimer.singleShot(0, QApplication.quit)
+
+    def clear_history(self, delete=False, only=None):
+        """Clear history (✓): finished jobs out of the list, logs kept.  Delete history (🗑): also delete their logs
+        (temporary local logs and the .out/.err on the clusters; -l logs are never deleted).  only = "Local" or the
+        name of one cluster (the ✓ / 🗑 of a group header); None = everything."""
+        local = only in (None, "Local")
+        clusters = [c for c in self.clusters if only in (None, c["name"]) and c["name"] in self.cstate]
+        visible = {c["name"]: [r["id"] for r in self.cstate[c["name"]].hist
+                               if r["end"] > c.get("cleared", 0) and r["id"] not in c.get("hidden", ())]
+                   for c in clusters}
+        tmp = temp_logs() if (delete and local) else []
+        where = "" if only is None else f" of {only}"
+        if delete:
+            title = "Delete history" + where
+            msg = f"Remove all finished jobs{where} from the history AND delete their logs?\n\n"
+            if local:
+                msg += (f"Local: {len(tmp)} temporary log(s) will be deleted (jobs launched without -l).  Logs saved "
+                        f"with -l and those of running jobs are not touched.\n" if tmp else
+                        "Local: there are no temporary logs to delete.\n")
+            if clusters:
+                n = sum(len(v) for v in visible.values())
+                msg += (f"\nClusters: the .out/.err of {n} finished job(s) will be deleted "
+                        f"({', '.join(f'{k}: {len(v)}' for k, v in visible.items())}); only files whose name "
+                        f"contains the job number.\n")
+            msg += "\nThis cannot be undone."
+        else:
+            title = "Clear history" + where
+            msg = (f"Remove all finished jobs{where} from the history?\n\nNothing is deleted: their logs stay where "
+                   f"they are (use 🗑 / «Delete history» to also delete them).")
+        if not ask(self, title, msg):
+            return
+        for p in tmp:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        if local:
+            for d in job_dirs():
+                p = os.path.join(d, "history.jsonl")
+                if os.path.exists(p):
+                    open(p, "w").close()
+        now = time.time()
+        for c in clusters:
+            if delete and visible.get(c["name"]):
+                self.delete_remote_logs(c, visible[c["name"]])
+            c["cleared"] = now; c["hidden"] = []
+        if clusters:
+            save_clusters(self.clusters)
+        if delete:      # close the tabs of the logs that no longer exist
+            names = {c["name"] for c in clusters}
+            self.close_log_tabs(lambda i: (i["kind"] == "local" and i.get("log") in tmp) or
+                                (i["kind"] != "local" and i.get("cluster") in names and not i.get("running")))
+        self.refresh()
+
+def main():
+    load_settings()
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP)
+    app.setDesktopFileName("tracktor")        # so the desktop shows the launcher's icon, not a generic one
+    app.setWindowIcon(app_icon())
+    app.setQuitOnLastWindowClosed(False)      # with the tray, closing the window does not quit
+    # Single instance: if one is already running (e.g. hidden in the tray), ask it to show itself and exit.
+    name = os.environ.get("TRACKTOR_INSTANCE", f"tracktor-{os.getuid()}")
+    sock = QLocalSocket(); sock.connectToServer(name)
+    if sock.waitForConnected(300):
+        sock.write(b"show"); sock.flush(); sock.waitForBytesWritten(300)
+        sys.exit(0)
+    QLocalServer.removeServer(name)
+    server = QLocalServer(); server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption); server.listen(name)
+    app.aboutToQuit.connect(lambda: taskbar_count(0))
+    w = Main(); w.show()
+    server.newConnection.connect(lambda: (server.nextPendingConnection(), w.show_window()))
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

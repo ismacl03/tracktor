@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4caf50"/>
+      <stop offset="1" stop-color="#1b5e20"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="26" fill="url(#bg)"/>
+  <!-- progress line coming out of the exhaust -->
+  <polyline points="90,40 97,28 104,34 116,16" fill="none" stroke="#c8f7c5" stroke-width="5"
+            stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- exhaust pipe -->
+  <rect x="86" y="40" width="7" height="22" rx="2" fill="#ffffff"/>
+  <!-- cabin with window -->
+  <rect x="26" y="30" width="38" height="44" rx="5" fill="#ffffff"/>
+  <rect x="33" y="37" width="24" height="17" rx="3" fill="#2e7d32"/>
+  <!-- hood -->
+  <rect x="58" y="58" width="48" height="22" rx="5" fill="#ffffff"/>
+  <!-- rear wheel -->
+  <circle cx="42" cy="88" r="23" fill="#ffffff"/>
+  <circle cx="42" cy="88" r="13" fill="#2e7d32"/>
+  <circle cx="42" cy="88" r="5" fill="#ffffff"/>
+  <!-- front wheel -->
+  <circle cx="96" cy="96" r="14" fill="#ffffff"/>
+  <circle cx="96" cy="96" r="7" fill="#2e7d32"/>
+  <circle cx="96" cy="96" r="2.5" fill="#ffffff"/>
+</svg>
