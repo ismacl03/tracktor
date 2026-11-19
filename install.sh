@@ -17,8 +17,16 @@ if ! python3 -c "import PyQt6.QtWidgets" 2>/dev/null; then
 fi
 
 mkdir -p ~/.local/bin ~/.local/state/tracktor ~/.config/tracktor ~/.local/share/applications \
-         ~/.local/share/tracktor/icons ~/.local/share/icons/hicolor/scalable/apps
-install -m 755 "$here/track" "$here/tracktor" ~/.local/bin/
+         ~/.local/share/tracktor/icons ~/.local/share/tracktor/lib ~/.local/share/icons/hicolor/scalable/apps
+# track is only replaced when it changed (running jobs are executing it)
+cmp -s "$here/track" ~/.local/bin/track || install -m 755 "$here/track" ~/.local/bin/
+install -m 755 "$here/tracktor" ~/.local/bin/
+# the program itself: the tracktor package (the launcher in ~/.local/bin finds it there)
+rm -rf ~/.local/share/tracktor/lib/tracktor.new
+cp -r "$here/src/tracktor" ~/.local/share/tracktor/lib/tracktor.new
+find ~/.local/share/tracktor/lib/tracktor.new -name __pycache__ -prune -exec rm -rf {} +
+rm -rf ~/.local/share/tracktor/lib/tracktor
+mv ~/.local/share/tracktor/lib/tracktor.new ~/.local/share/tracktor/lib/tracktor
 install -m 644 "$here"/icons/*.svg ~/.local/share/tracktor/icons/
 install -m 644 "$here/icons/tracktor.svg" ~/.local/share/icons/hicolor/scalable/apps/tracktor.svg
 
