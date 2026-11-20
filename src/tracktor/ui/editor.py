@@ -87,7 +87,7 @@ class EditorMixin:
             self.update_script_buttons()
 
     def on_text_edited(self):
-        if self._loading:
+        if self._loading or self.out.isReadOnly():      # only what the user types in an editable script
             return
         d = self.cur_script()
         if not d or d.get("orig") is None:

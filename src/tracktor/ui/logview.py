@@ -42,7 +42,11 @@ class LogViewMixin:
         self.sel = info
         extra = ""
         script = info["kind"] == "script"
-        self.hl.setDocument(None if script else self.out.document())   # no error/warning colours in scripts
+        # no error/warning colours in scripts.  Adding / removing them changes the formats of the text shown, which
+        # Qt reports as a text change: it must not count as an edit of the script (the log would become its text)
+        self._loading = True
+        self.hl.setDocument(None if script else self.out.document())
+        self._loading = False
         if not script:
             self.out.setReadOnly(True)
         if script:
